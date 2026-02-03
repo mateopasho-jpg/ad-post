@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "idempotency_key": "local_test:traffic_image_ad:v6",
+  "campaign": {
+    "name": "[TEST] Traffic Campaign (PAUSED)",
+    "objective": "OUTCOME_TRAFFIC",
+    "status": "PAUSED",
+    "special_ad_categories": [],
+    "is_adset_budget_sharing_enabled": false
+  },
+  "adset": {
+    "name": "[TEST] AdSet Link Clicks (PAUSED)",
+    "optimization_goal": "LINK_CLICKS",
+    "billing_event": "IMPRESSIONS",
+    "bid_strategy": "LOWEST_COST_WITHOUT_CAP",
+    "daily_budget": 1000,
+    "is_adset_budget_sharing_enabled": false,
+    "status": "PAUSED",
+
+    "dsa_beneficiary": "Mateo Pasho",
+    "dsa_payor": "Mateo Pasho",
+
+    "targeting": {
+      "geo_locations": { "countries": ["AT"] },
+      "age_min": 21,
+      "age_max": 65,
+      "facebook_positions": ["feed"]
+    }
+  },
+  "creative": {
+    "name": "[TEST] Single Image Creative",
+    "object_story_spec": {
+      "page_id": "999865253203298",
+      "link_data": {
+        "message": "This is my test ad text",
+        "link": "https://example.com",
+        "call_to_action": { "type": "LEARN_MORE" },
+        "image_hash": "__FROM_UPLOAD__"
+      }
+    }
+  },
+  "ad": {
+    "name": "[TEST] Ad (PAUSED)",
+    "status": "PAUSED"
+  },
+  "assets": {
+    "image_path": "examples/WhatsApp Image 2025-12-15 at 14.32.21.jpeg"
+  }
+}
