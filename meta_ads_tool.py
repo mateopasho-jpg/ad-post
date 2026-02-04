@@ -40,6 +40,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from typing import Optional
+from token_store import get_valid_access_token
 
 import requests
 from dotenv import load_dotenv
@@ -75,14 +76,26 @@ class MetaConfig:
         """Loads config from environment variables (optionally via .env)."""
         load_dotenv(override=False)
 
-        token = os.getenv("META_ACCESS_TOKEN", "").strip()
         account_id = os.getenv("META_AD_ACCOUNT_ID", "").strip()
         api_version = os.getenv("META_API_VERSION", "v21.0").strip() or "v21.0"
         app_id = os.getenv("META_APP_ID", "").strip() or None
         app_secret = os.getenv("META_APP_SECRET", "").strip() or None
 
+        # NEW: choose token source
+        token_source = os.getenv("META_TOKEN_SOURCE", "").strip().lower()  # set to "db" on Railway
+        database_url = os.getenv("DATABASE_URL", "").strip()
+
+        if token_source == "db":
+            if not database_url:
+                raise ValueError("META_TOKEN_SOURCE=db but DATABASE_URL is not set.")
+            token = get_valid_access_token(database_url)
+        else:
+            token = os.getenv("META_ACCESS_TOKEN", "").strip()
+
         if not token:
-            raise ValueError("Missing META_ACCESS_TOKEN in environment (.env).")
+            raise ValueError(
+                "Missing access token. Set META_ACCESS_TOKEN or set META_TOKEN_SOURCE=db with a DB token row."
+            )
         if not account_id:
             raise ValueError("Missing META_AD_ACCOUNT_ID in environment (.env).")
 
@@ -93,6 +106,7 @@ class MetaConfig:
             app_id=app_id,
             app_secret=app_secret,
         )
+
 
 
 def normalize_ad_account_id(ad_account_id: str) -> str:
