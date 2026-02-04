@@ -41,6 +41,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from typing import Optional
 from token_store import get_valid_access_token
+import io
+from PIL import Image
 
 import requests
 from dotenv import load_dotenv
@@ -436,32 +438,44 @@ class MetaClient:
     # Create flow (image -> creative -> ad)
     # -----------------------------
 
-    def upload_image(self, image_path: str, ad_account_id: str | None = None) -> str:
+    def upload_image(
+        self,
+        image_path: str | None = None,
+        *,
+        image_bytes: bytes | None = None,
+        filename: str = "image.jpg",
+        ad_account_id: str | None = None,
+    ) -> str:
         """
-        Uploads an image file and returns image_hash.
-        Per Meta docs, upload goes to /act_<AD_ACCOUNT_ID>/adimages with filename=@<IMAGE_PATH>.
+        Uploads an image and returns image_hash.
+        Most reliable method: multipart field 'bytes' with a real JPEG content-type.
         """
         acct = normalize_ad_account_id(ad_account_id or self.cfg.ad_account_id)
-        p = Path(image_path)
-        if not p.exists():
-            raise FileNotFoundError(f"Image file not found: {p}")
 
-        with p.open("rb") as f:
-            files = {"filename": (p.name, f, "application/octet-stream")}
-            payload = self._request("POST", f"/{acct}/adimages", files=files, data={})
+        if image_bytes is None:
+            if not image_path:
+                raise ValueError("Provide image_path or image_bytes.")
+            p = Path(image_path)
+            if not p.exists():
+                raise FileNotFoundError(f"Image file not found: {p}")
+            image_bytes = p.read_bytes()
+            filename = p.name or filename
+
+        # IMPORTANT: use 'bytes' field with filename + correct mime
+        files = {"bytes": (filename, image_bytes, "image/jpeg")}
+        payload = self._request("POST", f"/{acct}/adimages", files=files, data={})
 
         images = payload.get("images") or {}
         if not images:
             raise MetaAPIError(f"Upload did not return images. Response: {payload}")
 
-        # Response shape often: {"images": {"<hash>": {"hash":"<hash>", ...}}}
-        # We'll take the first image entry.
         first_key = next(iter(images.keys()))
         img_obj = images[first_key]
         image_hash = img_obj.get("hash") or first_key
         if not image_hash:
             raise MetaAPIError(f"Could not parse image_hash from response: {payload}")
         return image_hash
+
 
     def create_campaign(self, spec: CampaignSpec, *, dry_run: bool = False) -> str:
         acct = normalize_ad_account_id(self.cfg.ad_account_id)
@@ -683,28 +697,42 @@ def run_launch(
     return run_launch_plan(cfg, plan, store_path=store_path, dry_run=dry_run)
 
 
-def _download_image_to_temp(url: str, *, timeout_s: int = 30) -> Path:
-    """Downloads an image from a public URL to a temporary file and returns its path."""
+def _fetch_and_normalize_image_bytes(url: str, *, timeout_s: int = 30) -> tuple[bytes, str]:
+    """
+    Downloads an image and returns (jpeg_bytes, filename).
+    Always re-encodes to a Meta-safe JPEG to avoid 'Invalid image format'.
+    """
     url = (url or "").strip()
     if not url.lower().startswith(("http://", "https://")):
         raise ValueError("image_url must start with http:// or https://")
 
-    resp = requests.get(url, stream=True, timeout=timeout_s)
-    try:
-        resp.raise_for_status()
-        # Best-effort suffix (helps Meta infer type). Default to .jpg.
-        suffix = Path(url.split("?")[0]).suffix
-        if not suffix or len(suffix) > 6:
-            suffix = ".jpg"
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "image/*,*/*;q=0.8",
+    }
 
-        fd, tmp_path = tempfile.mkstemp(prefix="meta_img_", suffix=suffix)
-        with os.fdopen(fd, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=1024 * 256):
-                if chunk:
-                    f.write(chunk)
-        return Path(tmp_path)
-    finally:
-        resp.close()
+    resp = requests.get(url, headers=headers, timeout=timeout_s)
+    resp.raise_for_status()
+
+    ct = (resp.headers.get("Content-Type") or "").lower()
+    if "image" not in ct:
+        raise ValueError(f"URL did not return an image. Content-Type={ct} url={url}")
+
+    raw = resp.content
+
+    try:
+        img = Image.open(io.BytesIO(raw))
+        img = img.convert("RGB")
+    except Exception as e:
+        raise ValueError(f"Downloaded bytes are not a valid image: {e}")
+
+    out = io.BytesIO()
+    img.save(out, format="JPEG", quality=92, optimize=True)
+
+    # filename helps Meta; use .jpg always since we re-encode
+    filename = "image.jpg"
+    return out.getvalue(), filename
+
 
 
 def run_launch_plan(
@@ -727,70 +755,60 @@ def run_launch_plan(
         print(f"[IDEMPOTENT HIT] Found existing launch for key={idem_key}")
         return existing
 
-    tmp_image_path: Optional[Path] = None
-    try:
-        # 1) Upload image if needed
-        image_hash: Optional[str] = None
-        if plan.assets:
-            if plan.assets.image_hash:
-                image_hash = plan.assets.image_hash
+    # 1) Upload image if needed
+    image_hash: Optional[str] = None
+    if plan.assets:
+        if plan.assets.image_hash:
+            image_hash = plan.assets.image_hash
+
+        elif plan.assets.image_path:
+            if dry_run:
+                print("[DRY RUN] upload_image:", plan.assets.image_path)
+                image_hash = "DRY_RUN_IMAGE_HASH"
             else:
-                image_path: Optional[str] = None
-                if plan.assets.image_path:
-                    image_path = plan.assets.image_path
-                elif plan.assets.image_url:
-                    if dry_run:
-                        print("[DRY RUN] download+upload image_url:", plan.assets.image_url)
-                        image_hash = "DRY_RUN_IMAGE_HASH"
-                    else:
-                        tmp_image_path = _download_image_to_temp(
-                            plan.assets.image_url,
-                            timeout_s=cfg.timeout_s,
-                        )
-                        image_path = str(tmp_image_path)
+                image_hash = client.upload_image(plan.assets.image_path)
 
-                if image_hash is None and image_path:
-                    if dry_run:
-                        print("[DRY RUN] upload_image:", image_path)
-                        image_hash = "DRY_RUN_IMAGE_HASH"
-                    else:
-                        image_hash = client.upload_image(image_path)
+        elif plan.assets.image_url:
+            if dry_run:
+                print("[DRY RUN] download+normalize+upload image_url:", plan.assets.image_url)
+                image_hash = "DRY_RUN_IMAGE_HASH"
+            else:
+                img_bytes, fname = _fetch_and_normalize_image_bytes(
+                    plan.assets.image_url,
+                    timeout_s=cfg.timeout_s,
+                )
+                image_hash = client.upload_image(image_bytes=img_bytes, filename=fname)
 
-        if image_hash:
-            plan = inject_image_hash(plan, image_hash)
+    if image_hash:
+        plan = inject_image_hash(plan, image_hash)
 
-        # 2) Create campaign
-        campaign_id = client.create_campaign(plan.campaign, dry_run=dry_run)
-        # 3) Create ad set
-        adset_id = client.create_adset(plan.adset, campaign_id=campaign_id, dry_run=dry_run)
-        # 4) Create creative
-        creative_id = client.create_adcreative(plan.creative, dry_run=dry_run)
-        # 5) Create ad
-        ad_id = client.create_ad(plan.ad, adset_id=adset_id, creative_id=creative_id, dry_run=dry_run)
+    # 2) Create campaign
+    campaign_id = client.create_campaign(plan.campaign, dry_run=dry_run)
+    # 3) Create ad set
+    adset_id = client.create_adset(plan.adset, campaign_id=campaign_id, dry_run=dry_run)
+    # 4) Create creative
+    creative_id = client.create_adcreative(plan.creative, dry_run=dry_run)
+    # 5) Create ad
+    ad_id = client.create_ad(plan.ad, adset_id=adset_id, creative_id=creative_id, dry_run=dry_run)
 
-        result = {
-            "idempotency_key": idem_key,
-            "payload_sha256": payload_hash,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "campaign_id": campaign_id,
-            "adset_id": adset_id,
-            "creative_id": creative_id,
-            "ad_id": ad_id,
-        }
+    result = {
+        "idempotency_key": idem_key,
+        "payload_sha256": payload_hash,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "campaign_id": campaign_id,
+        "adset_id": adset_id,
+        "creative_id": creative_id,
+        "ad_id": ad_id,
+    }
 
-        # ✅ DO NOT store dry-run results, otherwise real runs get blocked with DRY_RUN ids
-        if not dry_run:
-            store.put(idem_key, payload_hash, result)
+    # ✅ DO NOT store dry-run results, otherwise real runs get blocked with DRY_RUN ids
+    if not dry_run:
+        store.put(idem_key, payload_hash, result)
 
-        print("[SUCCESS] Created objects:")
-        print(json.dumps(result, indent=2))
-        return result
-    finally:
-        if tmp_image_path and tmp_image_path.exists():
-            try:
-                tmp_image_path.unlink()
-            except Exception:
-                pass
+    print("[SUCCESS] Created objects:")
+    print(json.dumps(result, indent=2))
+    return result
+
 
 
 
