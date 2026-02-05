@@ -155,7 +155,7 @@ def run(req: RunRequest, x_api_key: Optional[str] = Header(default=None, alias="
             },
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.post("/run-multipart")
