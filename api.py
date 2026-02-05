@@ -73,9 +73,18 @@ class RunRequest(BaseModel):
     }
     """
 
-    job_id: Optional[str] = Field(default=None, description="Optional external job identifier (e.g., Notion page id).")
-    idempotency_key: Optional[str] = Field(default=None, description="Overrides plan.idempotency_key")
-    dry_run: bool = Field(default=False, description="If true, prints requests without calling Meta.")
+    job_id: Optional[str] = Field(
+        default=None,
+        description="Optional external job identifier (e.g., Notion page id).",
+    )
+    idempotency_key: Optional[str] = Field(
+        default=None,
+        description="Overrides plan.idempotency_key",
+    )
+    dry_run: bool = Field(
+        default=False,
+        description="If true, prints requests without calling Meta.",
+    )
     plan: Dict[str, Any]
 
 
@@ -93,14 +102,14 @@ def _normalize_to_jpeg_bytes(raw: bytes) -> bytes:
         img = Image.open(io.BytesIO(raw))
         img = img.convert("RGB")
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Uploaded image_file is not a valid image: {e}")
+        raise HTTPException(status_code=422, detail=f"Uploaded image_file is not a valid image: {e}")
 
     out = io.BytesIO()
     img.save(out, format="JPEG", quality=92, optimize=True)
     jpeg_bytes = out.getvalue()
 
     if not jpeg_bytes or len(jpeg_bytes) < 1024:
-        raise HTTPException(status_code=400, detail="JPEG re-encode failed or output too small")
+        raise HTTPException(status_code=422, detail="JPEG re-encode failed or output too small")
 
     return jpeg_bytes
 
@@ -180,13 +189,26 @@ async def run_multipart(
         if idempotency_key:
             plan_obj.idempotency_key = idempotency_key
 
+        debug: Dict[str, Any] = {}
+
         # If a file is provided, upload it to Meta and inject image_hash
         if image_file is not None:
             raw = await image_file.read()
+            debug["received_filename"] = image_file.filename
+            debug["received_content_type"] = image_file.content_type
+            debug["received_size_bytes"] = len(raw or b"")
+
             if not raw or len(raw) < 1024:
-                raise HTTPException(status_code=400, detail="Uploaded image_file is empty or too small")
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "message": "Uploaded image_file is empty or too small. Make is likely not sending file bytes.",
+                        **debug,
+                    },
+                )
 
             jpeg_bytes = _normalize_to_jpeg_bytes(raw)
+            debug["jpeg_size_bytes"] = len(jpeg_bytes)
 
             # Upload bytes directly (most reliable)
             client = MetaClient(cfg)
@@ -200,10 +222,10 @@ async def run_multipart(
             plan_obj.assets.image_path = None
 
         result = run_launch_plan(cfg, plan_obj, store_path=store_path, dry_run=dry_run)
-        return {"ok": True, "job_id": job_id, "result": result}
+        return {"ok": True, "job_id": job_id, "result": result, "debug": debug}
 
     except json.JSONDecodeError as e:
-        raise HTTPException(status_code=400, detail=f"Invalid JSON in form field 'plan': {e}")
+        raise HTTPException(status_code=422, detail=f"Invalid JSON in form field 'plan': {e}")
     except ValidationError as e:
         raise HTTPException(status_code=422, detail=e.errors())
     except MetaAPIError as e:
