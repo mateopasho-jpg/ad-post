@@ -177,7 +177,7 @@ async def run_multipart(
     try:
         cfg = MetaConfig.from_env()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Server misconfigured: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
 
     store_path = (os.getenv("IDEMPOTENCY_DB_PATH") or ".meta_idempotency.db").strip() or ".meta_idempotency.db"
 
