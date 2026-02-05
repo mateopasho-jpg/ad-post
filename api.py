@@ -45,6 +45,7 @@ import os
 from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError
 from PIL import Image
@@ -144,7 +145,7 @@ def run(req: RunRequest, x_api_key: Optional[str] = Header(default=None, alias="
         return {"ok": True, "job_id": req.job_id, "result": result}
 
     except ValidationError as e:
-        raise HTTPException(status_code=422, detail=e.errors())
+        raise HTTPException(status_code=422, detail=jsonable_encoder(e.errors()))
     except MetaAPIError as e:
         raise HTTPException(
             status_code=502,
@@ -155,7 +156,7 @@ def run(req: RunRequest, x_api_key: Optional[str] = Header(default=None, alias="
             },
         )
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/run-multipart")
@@ -177,13 +178,23 @@ async def run_multipart(
     try:
         cfg = MetaConfig.from_env()
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Server misconfigured: {e}")
 
     store_path = (os.getenv("IDEMPOTENCY_DB_PATH") or ".meta_idempotency.db").strip() or ".meta_idempotency.db"
 
     try:
         # Parse plan JSON string -> LaunchPlan
         plan_dict = json.loads(plan)
+
+        # If the request includes an uploaded file, the LaunchPlan validator still requires
+        # one of: image_hash, image_path, image_url. We'll seed a placeholder so validation passes,
+        # then replace it with the real uploaded image_hash after uploading.
+        if image_file is not None:
+            assets = plan_dict.get("assets") or {}
+            if not (assets.get("image_hash") or assets.get("image_path") or assets.get("image_url")):
+                assets["image_hash"] = "__uploaded_via_multipart__"
+            plan_dict["assets"] = assets
+
         plan_obj = LaunchPlan.model_validate(plan_dict)
 
         if idempotency_key:
@@ -227,7 +238,7 @@ async def run_multipart(
     except json.JSONDecodeError as e:
         raise HTTPException(status_code=422, detail=f"Invalid JSON in form field 'plan': {e}")
     except ValidationError as e:
-        raise HTTPException(status_code=422, detail=e.errors())
+        raise HTTPException(status_code=422, detail=jsonable_encoder(e.errors()))
     except MetaAPIError as e:
         raise HTTPException(
             status_code=502,
