@@ -699,17 +699,17 @@ def run_launch(
 
 def _fetch_and_normalize_image_bytes(url: str, *, timeout_s: int = 30) -> tuple[bytes, str]:
     """
-    Downloads an image URL and returns (jpeg_bytes, filename).
-
-    - Follows redirects (important for Google Drive / CDNs).
-    - Uses browser-like headers to reduce bot-blocking.
-    - Validates response is actually an image (not HTML).
-    - Rejects suspiciously small payloads (e.g. 8 bytes).
-    - Re-encodes to a Meta-safe JPEG to avoid "Invalid image format".
+    Downloads an image URL, normalizes it to a Meta-safe JPEG,
+    and returns (jpeg_bytes, filename).
     """
     url = (url or "").strip()
     if not url.lower().startswith(("http://", "https://")):
         raise ValueError("image_url must start with http:// or https://")
+
+    # Normalize Google Drive "view" links -> direct download
+    if "drive.google.com/file/d/" in url:
+        file_id = url.split("/file/d/")[1].split("/")[0]
+        url = f"https://drive.google.com/uc?export=download&id={file_id}"
 
     headers = {
         "User-Agent": (
@@ -719,59 +719,42 @@ def _fetch_and_normalize_image_bytes(url: str, *, timeout_s: int = 30) -> tuple[
         ),
         "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
     }
 
-    # Use a session so redirects/cookies behave more like a browser
-    session = requests.Session()
-    resp = session.get(
-        url,
-        headers=headers,
-        timeout=timeout_s,
-        allow_redirects=True,
-        stream=False,
-    )
+    resp = requests.get(url, headers=headers, timeout=timeout_s, allow_redirects=True)
     resp.raise_for_status()
 
     ct = (resp.headers.get("Content-Type") or "").lower()
     raw = resp.content or b""
 
-    # Hard guard: tiny bodies are never valid images
+    # Guard: if it's tiny, it's not an image (prevents Meta file_size: 8)
     if len(raw) < 1024:
-        preview = raw[:200]
         raise ValueError(
             f"Downloaded content too small to be an image ({len(raw)} bytes). "
-            f"content-type={ct} final_url={resp.url} preview={preview!r}"
+            f"content-type={ct} final_url={resp.url} preview={raw[:200]!r}"
         )
 
-    # Many providers mislabel content-type, but HTML is a clear fail
-    if "text/html" in ct or "application/xhtml" in ct:
-        preview = raw[:200]
+    # Guard: HTML means "not actually an image"
+    if "text/html" in ct or raw[:20].lstrip().lower().startswith(b"<html"):
         raise ValueError(
-            f"URL returned HTML, not an image. content-type={ct} final_url={resp.url} preview={preview!r}"
+            f"URL returned HTML, not an image. content-type={ct} final_url={resp.url} preview={raw[:200]!r}"
         )
-
-    # Prefer content-type check, but don't rely on it exclusively
-    if "image" not in ct:
-        # If it's not labeled as image, still try Pillow; if it fails we raise a clear error.
-        pass
 
     try:
         img = Image.open(io.BytesIO(raw))
-        img = img.convert("RGB")  # Meta-safe baseline
+        img = img.convert("RGB")
     except Exception as e:
-        preview = raw[:200]
-        raise ValueError(
-            f"Downloaded bytes are not a valid image. "
-            f"content-type={ct} final_url={resp.url} error={e} preview={preview!r}"
-        )
+        raise ValueError(f"Downloaded bytes are not a valid image: {e}")
 
     out = io.BytesIO()
     img.save(out, format="JPEG", quality=92, optimize=True)
+    jpeg_bytes = out.getvalue()
 
-    # Always return a .jpg filename since we re-encoded to JPEG
-    return out.getvalue(), "image.jpg"
+    if len(jpeg_bytes) < 1024:
+        raise ValueError("JPEG re-encode failed; output too small")
+
+    return jpeg_bytes, "image.jpg"
+
 
 
 
@@ -807,7 +790,7 @@ def run_launch_plan(
                 print("[DRY RUN] upload_image:", plan.assets.image_path)
                 image_hash = "DRY_RUN_IMAGE_HASH"
             else:
-                image_hash = client.upload_image(plan.assets.image_path)
+                image_hash = client.upload_image(image_path=plan.assets.image_path)
 
         elif plan.assets.image_url:
             if dry_run:
@@ -818,7 +801,11 @@ def run_launch_plan(
                     plan.assets.image_url,
                     timeout_s=cfg.timeout_s,
                 )
-                image_hash = client.upload_image(image_bytes=img_bytes, filename=fname)
+                image_hash = client.upload_image(
+                    image_bytes=img_bytes,
+                    filename=fname,
+                )
+
 
     if image_hash:
         plan = inject_image_hash(plan, image_hash)
