@@ -699,39 +699,80 @@ def run_launch(
 
 def _fetch_and_normalize_image_bytes(url: str, *, timeout_s: int = 30) -> tuple[bytes, str]:
     """
-    Downloads an image and returns (jpeg_bytes, filename).
-    Always re-encodes to a Meta-safe JPEG to avoid 'Invalid image format'.
+    Downloads an image URL and returns (jpeg_bytes, filename).
+
+    - Follows redirects (important for Google Drive / CDNs).
+    - Uses browser-like headers to reduce bot-blocking.
+    - Validates response is actually an image (not HTML).
+    - Rejects suspiciously small payloads (e.g. 8 bytes).
+    - Re-encodes to a Meta-safe JPEG to avoid "Invalid image format".
     """
     url = (url or "").strip()
     if not url.lower().startswith(("http://", "https://")):
         raise ValueError("image_url must start with http:// or https://")
 
     headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "image/*,*/*;q=0.8",
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0 Safari/537.36"
+        ),
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
     }
 
-    resp = requests.get(url, headers=headers, timeout=timeout_s)
+    # Use a session so redirects/cookies behave more like a browser
+    session = requests.Session()
+    resp = session.get(
+        url,
+        headers=headers,
+        timeout=timeout_s,
+        allow_redirects=True,
+        stream=False,
+    )
     resp.raise_for_status()
 
     ct = (resp.headers.get("Content-Type") or "").lower()
-    if "image" not in ct:
-        raise ValueError(f"URL did not return an image. Content-Type={ct} url={url}")
+    raw = resp.content or b""
 
-    raw = resp.content
+    # Hard guard: tiny bodies are never valid images
+    if len(raw) < 1024:
+        preview = raw[:200]
+        raise ValueError(
+            f"Downloaded content too small to be an image ({len(raw)} bytes). "
+            f"content-type={ct} final_url={resp.url} preview={preview!r}"
+        )
+
+    # Many providers mislabel content-type, but HTML is a clear fail
+    if "text/html" in ct or "application/xhtml" in ct:
+        preview = raw[:200]
+        raise ValueError(
+            f"URL returned HTML, not an image. content-type={ct} final_url={resp.url} preview={preview!r}"
+        )
+
+    # Prefer content-type check, but don't rely on it exclusively
+    if "image" not in ct:
+        # If it's not labeled as image, still try Pillow; if it fails we raise a clear error.
+        pass
 
     try:
         img = Image.open(io.BytesIO(raw))
-        img = img.convert("RGB")
+        img = img.convert("RGB")  # Meta-safe baseline
     except Exception as e:
-        raise ValueError(f"Downloaded bytes are not a valid image: {e}")
+        preview = raw[:200]
+        raise ValueError(
+            f"Downloaded bytes are not a valid image. "
+            f"content-type={ct} final_url={resp.url} error={e} preview={preview!r}"
+        )
 
     out = io.BytesIO()
     img.save(out, format="JPEG", quality=92, optimize=True)
 
-    # filename helps Meta; use .jpg always since we re-encode
-    filename = "image.jpg"
-    return out.getvalue(), filename
+    # Always return a .jpg filename since we re-encoded to JPEG
+    return out.getvalue(), "image.jpg"
+
 
 
 
