@@ -364,9 +364,14 @@ class MetaClient:
                 hashlib.sha256,
             ).hexdigest()
             if method.upper() == "GET":
-                params.setdefault("appsecret_proof", proof)
+                params.setdefault("access_token", self.cfg.access_token)
             else:
-                data.setdefault("appsecret_proof", proof)
+                # if we're uploading files (multipart), send token via query params
+                if files is not None:
+                    params.setdefault("access_token", self.cfg.access_token)
+                else:
+                    data.setdefault("access_token", self.cfg.access_token)
+
 
         last_err: Optional[Exception] = None
         for attempt in range(max_retries + 1):
@@ -462,8 +467,10 @@ class MetaClient:
             filename = p.name or filename
 
         # IMPORTANT: use 'bytes' field with filename + correct mime
-        files = {"bytes": (filename, image_bytes, "image/jpeg")}
+        # Meta expects the file under the multipart field name `filename`
+        files = {"filename": (filename, image_bytes, "image/jpeg")}
         payload = self._request("POST", f"/{acct}/adimages", files=files, data={})
+
 
         images = payload.get("images") or {}
         if not images:
