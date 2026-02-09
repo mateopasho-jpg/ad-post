@@ -5,3 +5,7 @@ __pycache__/
 .idempotency.sqlite
 .idempotency.sqlite-journal
 .DS_Store
+
+# Local test artifacts
+.meta_idempotency.db
+plan_*.json
