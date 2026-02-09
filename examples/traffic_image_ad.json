@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "idempotency_key": "local_test:traffic_image_ad:v6",
+  "product": "green",
   "campaign": {
     "name": "[TEST] Traffic Campaign (PAUSED)",
     "objective": "OUTCOME_TRAFFIC",

@@ -76,7 +76,6 @@ curl -X POST http://localhost:8080/run \
   -H 'X-API-Key: YOUR_SERVICE_API_KEY' \
   -d '{
     "job_id": "local-test",
-    "idempotency_key": "local_test:traffic_image_ad:v5",
     "dry_run": true,
     "plan": '"$(cat examples/traffic_image_ad.json)"'
   }'
@@ -85,6 +84,12 @@ curl -X POST http://localhost:8080/run \
 Notes:
 - If you do not set `SERVICE_API_KEY`, you can omit the `X-API-Key` header.
 - For automation (Notion/Make), prefer `assets.image_url` over `assets.image_path`.
+
+Routing:
+- `plan.product` is required (`green`, `lila`, `rosa`). The backend will **route the ad into the corresponding product campaign**.
+- You can configure the canonical campaign names via `PRODUCT_CAMPAIGN_NAMES` (JSON string), e.g.
+  `{"green":"GREEN | Main","lila":"LILA | Main","rosa":"ROSA | Main"}`.
+- AdSets are auto-chosen from `plan.creative.name` by grouping variants in buckets of 5 (see below).
 
 ### Find your Page ID / IG actor ID (optional but usually needed for creatives)
 
@@ -113,6 +118,18 @@ python meta_ads_tool.py launch --plan examples/traffic_image_ad.json
 ```
 
 Re-running the same plan will not create duplicates (local idempotency).
+
+### Product routing + adset bucketing
+
+Your LaunchPlan must include a `product` field (`green`, `lila`, or `rosa`).
+The backend routes each launch into a *canonical product campaign* (get-or-create by name), and then
+places ads into ad sets grouped by 5 creatives based on the pattern in `creative.name` (e.g. `3807_0_...`).
+
+You can override the campaign names via:
+
+```bash
+PRODUCT_CAMPAIGN_NAMES='{"green":"GREEN | Main Campaign","lila":"LILA | Main Campaign","rosa":"ROSA | Main Campaign"}'
+```
 
 ### Using an image URL instead of a local path
 

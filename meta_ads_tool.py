@@ -38,8 +38,8 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-from typing import Optional
+from typing import Any, Dict, List, Optional, Tuple, Literal
+import re
 from token_store import get_valid_access_token
 import io
 from PIL import Image
@@ -144,8 +144,8 @@ class IdempotencyStore:
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(
                 """
-                CREATE TABLE IF NOT EXISTS launches (
-                    idempotency_key TEXT PRIMARY KEY,
+                CREATE TABLE IF NOT EXISTS launches_v2 (
+                    launch_key TEXT PRIMARY KEY,
                     payload_sha256 TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     campaign_id TEXT,
@@ -155,19 +155,91 @@ class IdempotencyStore:
                 )
                 """
             )
+
+            # Cache so repeated runs don't scan Meta for campaign/adset IDs.
+            # Also helps reduce duplicate creates under concurrent requests.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS campaign_cache (
+                    product TEXT PRIMARY KEY,
+                    campaign_name TEXT NOT NULL,
+                    campaign_id TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS adset_cache (
+                    campaign_id TEXT NOT NULL,
+                    batch_id TEXT NOT NULL,
+                    bucket INTEGER NOT NULL,
+                    adset_name TEXT NOT NULL,
+                    adset_id TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (campaign_id, batch_id, bucket)
+                )
+                """
+            )
+            conn.commit()
+
+    def get_cached_campaign_id(self, product: str) -> Optional[str]:
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute(
+                "SELECT campaign_id FROM campaign_cache WHERE product=?",
+                (product,),
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+        return str(row[0]) if row[0] else None
+
+    def put_cached_campaign_id(self, product: str, campaign_name: str, campaign_id: str) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO campaign_cache (product, campaign_name, campaign_id, updated_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (product, campaign_name, campaign_id, now),
+            )
+            conn.commit()
+
+    def get_cached_adset_id(self, campaign_id: str, batch_id: str, bucket: int) -> Optional[str]:
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute(
+                "SELECT adset_id FROM adset_cache WHERE campaign_id=? AND batch_id=? AND bucket=?",
+                (campaign_id, batch_id, int(bucket)),
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+        return str(row[0]) if row[0] else None
+
+    def put_cached_adset_id(self, campaign_id: str, batch_id: str, bucket: int, adset_name: str, adset_id: str) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO adset_cache (campaign_id, batch_id, bucket, adset_name, adset_id, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (campaign_id, batch_id, int(bucket), adset_name, adset_id, now),
+            )
             conn.commit()
 
     def get(self, key: str) -> Optional[dict]:
         with sqlite3.connect(self.db_path) as conn:
             cur = conn.execute(
-                "SELECT idempotency_key, payload_sha256, created_at, campaign_id, adset_id, creative_id, ad_id FROM launches WHERE idempotency_key=?",
+                "SELECT launch_key, payload_sha256, created_at, campaign_id, adset_id, creative_id, ad_id FROM launches_v2 WHERE launch_key=?",
                 (key,),
             )
             row = cur.fetchone()
         if not row:
             return None
         return {
-            "idempotency_key": row[0],
+            "launch_key": row[0],
             "payload_sha256": row[1],
             "created_at": row[2],
             "campaign_id": row[3],
@@ -181,8 +253,8 @@ class IdempotencyStore:
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(
                 """
-                INSERT OR REPLACE INTO launches
-                (idempotency_key, payload_sha256, created_at, campaign_id, adset_id, creative_id, ad_id)
+                INSERT OR REPLACE INTO launches_v2
+                (launch_key, payload_sha256, created_at, campaign_id, adset_id, creative_id, ad_id)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
@@ -280,7 +352,9 @@ class AssetsSpec(BaseModel):
 
 class LaunchPlan(BaseModel):
     schema_version: int = 1
-    idempotency_key: Optional[str] = None
+
+    # Required routing key (drives campaign selection)
+    product: str = Field(description="Product key used for routing (green | lila | rosa).")
 
     campaign: CampaignSpec
     adset: AdSetSpec
@@ -293,6 +367,14 @@ class LaunchPlan(BaseModel):
         if self.assets:
             if not self.assets.image_hash and not self.assets.image_path and not self.assets.image_url:
                 raise ValueError("assets must include image_hash, image_path, or image_url (for upload).")
+        return self
+
+    @model_validator(mode="after")
+    def _check_product(self) -> "LaunchPlan":
+        v = (self.product or "").strip().lower()
+        if v not in {"green", "lila", "rosa"}:
+            raise ValueError("product must be one of: green, lila, rosa")
+        self.product = v
         return self
 
     @model_validator(mode="after")
@@ -438,6 +520,67 @@ class MetaClient:
     def get_instagram_accounts(self, ad_account_id: str | None = None) -> dict:
         acct = normalize_ad_account_id(ad_account_id or self.cfg.ad_account_id)
         return self._request("GET", f"/{acct}/instagram_accounts")
+
+    # -----------------------------
+    # Lookup helpers (for get-or-create)
+    # -----------------------------
+
+    def _get_all_pages(self, path: str, *, params: dict, max_pages: int = 8) -> List[dict]:
+        """Collects up to `max_pages` pages for a Graph API edge."""
+        out: List[dict] = []
+        after: str | None = None
+        for _ in range(max_pages):
+            p = dict(params)
+            if after:
+                p["after"] = after
+            payload = self._request("GET", path, params=p)
+            data = payload.get("data") or []
+            if isinstance(data, list):
+                out.extend(data)
+            cursors = ((payload.get("paging") or {}).get("cursors") or {})
+            after = cursors.get("after")
+            if not after:
+                break
+        return out
+
+    def find_campaign_id_by_name(self, campaign_name: str, *, limit: int = 200) -> Optional[str]:
+        acct = normalize_ad_account_id(self.cfg.ad_account_id)
+        name = (campaign_name or "").strip()
+        if not name:
+            return None
+
+        # Prefer server-side filtering if supported.
+        params = {
+            "fields": "id,name",
+            "limit": str(limit),
+            "filtering": json.dumps([
+                {"field": "name", "operator": "EQUAL", "value": name}
+            ]),
+        }
+        rows = self._get_all_pages(f"/{acct}/campaigns", params=params)
+        for r in rows:
+            if (r.get("name") or "").strip() == name and r.get("id"):
+                return str(r["id"])
+        return None
+
+    def find_adset_id_by_name(self, campaign_id: str, adset_name: str, *, limit: int = 200) -> Optional[str]:
+        cid = (campaign_id or "").strip()
+        name = (adset_name or "").strip()
+        if not cid or not name:
+            return None
+
+        params = {
+            "fields": "id,name",
+            "limit": str(limit),
+            "filtering": json.dumps([
+                {"field": "name", "operator": "EQUAL", "value": name}
+            ]),
+        }
+        rows = self._get_all_pages(f"/{cid}/adsets", params=params)
+        for r in rows:
+            if (r.get("name") or "").strip() == name and r.get("id"):
+                return str(r["id"])
+        return None
 
     # -----------------------------
     # Create flow (image -> creative -> ad)
@@ -674,19 +817,60 @@ def inject_image_hash(plan: LaunchPlan, image_hash: str) -> LaunchPlan:
     return plan
 
 
-def default_idempotency_key(plan: LaunchPlan) -> str:
+# -----------------------------
+# Routing helpers (product -> campaign, creative name -> adset bucket)
+# -----------------------------
+
+_CREATIVE_NAME_RE = re.compile(r"^(?P<batch>\d+)[_\-](?P<idx>\d+)[_\-].+")
+
+
+def resolve_campaign_name(product: str) -> str:
+    """Maps product key -> canonical campaign name.
+
+    Configure in env:
+      PRODUCT_CAMPAIGN_NAMES='{"green":"GREEN | Main","lila":"LILA | Main","rosa":"ROSA | Main"}'
     """
-    Default stable key: sha256 of core campaign/adset/creative/ad specs (excluding local image path).
-    Good enough for test runs.
-    """
-    core = {
-        "schema_version": plan.schema_version,
-        "campaign": plan.campaign.model_dump(),
-        "adset": plan.adset.model_dump(),
-        "creative": plan.creative.model_dump(),
-        "ad": plan.ad.model_dump(),
+    raw = (os.getenv("PRODUCT_CAMPAIGN_NAMES") or "").strip()
+    if raw:
+        try:
+            mapping = json.loads(raw)
+            if isinstance(mapping, dict) and product in mapping and str(mapping[product]).strip():
+                return str(mapping[product]).strip()
+        except Exception:
+            # fall back to defaults below
+            pass
+
+    # Safe defaults if env is not set
+    defaults = {
+        "green": "GREEN | Main Campaign",
+        "lila": "LILA | Main Campaign",
+        "rosa": "ROSA | Main Campaign",
     }
-    return f"plan:{sha256_json(core)[:20]}"
+    return defaults.get(product, f"{product.upper()} | Main Campaign")
+
+
+def parse_batch_and_bucket(creative_name: str) -> tuple[str, int]:
+    """Returns (batch_id, bucket) where bucket groups variants of 5.
+
+    Expected creative name pattern:
+      3807_0_Grüne Helfer
+      3807_4_Grüne Helfer
+    """
+    name = (creative_name or "").strip()
+    m = _CREATIVE_NAME_RE.match(name)
+    if not m:
+        raise ValueError(
+            "creative.name must match '<batch>_<index>_<label>' (e.g., 3807_0_Grüne Helfer). "
+            f"Got: {creative_name!r}"
+        )
+    batch = m.group("batch")
+    idx = int(m.group("idx"))
+    bucket = (idx // 5) + 1
+    return batch, bucket
+
+
+def build_adset_name(product: str, batch_id: str, bucket: int) -> str:
+    return f"{product.upper()} | {batch_id} | {bucket:02d}"
 
 
 # -----------------------------
@@ -777,13 +961,16 @@ def run_launch_plan(
     client = MetaClient(cfg)
     store = IdempotencyStore(Path(store_path))
 
+    # Deterministic internal key (no idempotency_key field required from clients)
+    launch_key_raw = f"{plan.product}::{plan.creative.name}::{plan.ad.name}".encode("utf-8")
+    launch_key = "launch:" + hashlib.sha256(launch_key_raw).hexdigest()[:24]
+
     plan_dict = plan.model_dump()
-    idem_key = plan.idempotency_key or default_idempotency_key(plan)
     payload_hash = sha256_json(plan_dict)
 
-    existing = store.get(idem_key)
+    existing = store.get(launch_key)
     if existing:
-        print(f"[IDEMPOTENT HIT] Found existing launch for key={idem_key}")
+        print(f"[IDEMPOTENT HIT] Found existing launch for key={launch_key}")
         return existing
 
     # 1) Upload image if needed
@@ -817,19 +1004,51 @@ def run_launch_plan(
     if image_hash:
         plan = inject_image_hash(plan, image_hash)
 
-    # 2) Create campaign
-    campaign_id = client.create_campaign(plan.campaign, dry_run=dry_run)
-    # 3) Create ad set
-    adset_id = client.create_adset(plan.adset, campaign_id=campaign_id, dry_run=dry_run)
+    # 2) Get-or-create campaign based on product
+    campaign_name = resolve_campaign_name(plan.product)
+    if dry_run:
+        print(f"[DRY RUN] get-or-create campaign for product={plan.product} name={campaign_name!r}")
+        campaign_id = "DRY_RUN_CAMPAIGN_ID"
+    else:
+        campaign_id = store.get_cached_campaign_id(plan.product)
+        if not campaign_id:
+            campaign_id = client.find_campaign_id_by_name(campaign_name)
+            if campaign_id:
+                store.put_cached_campaign_id(plan.product, campaign_name, campaign_id)
+        if not campaign_id:
+            campaign_spec = plan.campaign.model_copy(update={"name": campaign_name})
+            campaign_id = client.create_campaign(campaign_spec, dry_run=False)
+            store.put_cached_campaign_id(plan.product, campaign_name, campaign_id)
+
+    # 3) Get-or-create adset: group variants of 5 into a bucket
+    batch_id, bucket = parse_batch_and_bucket(plan.creative.name)
+    adset_name = build_adset_name(plan.product, batch_id, bucket)
+
+    if dry_run:
+        print(f"[DRY RUN] get-or-create adset campaign_id={campaign_id} name={adset_name!r}")
+        adset_id = "DRY_RUN_ADSET_ID"
+    else:
+        adset_id = store.get_cached_adset_id(campaign_id, batch_id, bucket)
+        if not adset_id:
+            adset_id = client.find_adset_id_by_name(campaign_id, adset_name)
+            if adset_id:
+                store.put_cached_adset_id(campaign_id, batch_id, bucket, adset_name, adset_id)
+        if not adset_id:
+            adset_spec = plan.adset.model_copy(update={"name": adset_name})
+            adset_id = client.create_adset(adset_spec, campaign_id=campaign_id, dry_run=False)
+            store.put_cached_adset_id(campaign_id, batch_id, bucket, adset_name, adset_id)
     # 4) Create creative
     creative_id = client.create_adcreative(plan.creative, dry_run=dry_run)
     # 5) Create ad
     ad_id = client.create_ad(plan.ad, adset_id=adset_id, creative_id=creative_id, dry_run=dry_run)
 
     result = {
-        "idempotency_key": idem_key,
+        "launch_key": launch_key,
         "payload_sha256": payload_hash,
         "created_at": datetime.now(timezone.utc).isoformat(),
+        "product": plan.product,
+        "campaign_name": campaign_name,
+        "adset_name": adset_name,
         "campaign_id": campaign_id,
         "adset_id": adset_id,
         "creative_id": creative_id,
@@ -838,7 +1057,7 @@ def run_launch_plan(
 
     # ✅ DO NOT store dry-run results, otherwise real runs get blocked with DRY_RUN ids
     if not dry_run:
-        store.put(idem_key, payload_hash, result)
+        store.put(launch_key, payload_hash, result)
 
     print("[SUCCESS] Created objects:")
     print(json.dumps(result, indent=2))

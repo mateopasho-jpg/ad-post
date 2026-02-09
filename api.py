@@ -7,7 +7,7 @@ Endpoints
 ---------
 - GET  /health        -> basic health check
 - GET  /              -> basic root info
-- POST /run           -> JSON body: validate + run a LaunchPlan (idempotent)
+- POST /run           -> JSON body: validate + run a LaunchPlan
 - POST /run-multipart -> multipart/form-data: plan JSON + optional image file
 
 Optional API Key
@@ -68,7 +68,6 @@ class RunRequest(BaseModel):
     Typical Make.com payload:
     {
       "job_id": "<notion page id>",
-      "idempotency_key": "<unique key>",
       "dry_run": false,
       "plan": { ... LaunchPlan JSON ... }
     }
@@ -77,10 +76,6 @@ class RunRequest(BaseModel):
     job_id: Optional[str] = Field(
         default=None,
         description="Optional external job identifier (e.g., Notion page id).",
-    )
-    idempotency_key: Optional[str] = Field(
-        default=None,
-        description="Overrides plan.idempotency_key",
     )
     dry_run: bool = Field(
         default=False,
@@ -138,9 +133,6 @@ def run(req: RunRequest, x_api_key: Optional[str] = Header(default=None, alias="
 
     try:
         plan = LaunchPlan.model_validate(req.plan)
-        if req.idempotency_key:
-            plan.idempotency_key = req.idempotency_key
-
         result = run_launch_plan(cfg, plan, store_path=store_path, dry_run=req.dry_run)
         return {"ok": True, "job_id": req.job_id, "result": result}
 
@@ -163,7 +155,6 @@ def run(req: RunRequest, x_api_key: Optional[str] = Header(default=None, alias="
 async def run_multipart(
     plan: str = Form(..., description="LaunchPlan JSON as a string"),
     dry_run: bool = Form(False),
-    idempotency_key: Optional[str] = Form(None),
     job_id: Optional[str] = Form(None),
     image_file: UploadFile | None = File(None, description="Image file (jpg/png/etc)"),
     x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
@@ -196,9 +187,6 @@ async def run_multipart(
             plan_dict["assets"] = assets
 
         plan_obj = LaunchPlan.model_validate(plan_dict)
-
-        if idempotency_key:
-            plan_obj.idempotency_key = idempotency_key
 
         debug: Dict[str, Any] = {}
 
