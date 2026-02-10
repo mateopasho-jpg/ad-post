@@ -206,6 +206,11 @@ class IdempotencyStore:
             )
             conn.commit()
 
+    def delete_cached_campaign_id(self, product: str) -> None:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("DELETE FROM campaign_cache WHERE product=?", (product,))
+            conn.commit()
+
     def get_cached_adset_id(self, campaign_id: str, batch_id: str, bucket: int) -> Optional[str]:
         with sqlite3.connect(self.db_path) as conn:
             cur = conn.execute(
@@ -227,6 +232,11 @@ class IdempotencyStore:
                 """,
                 (campaign_id, batch_id, int(bucket), adset_name, adset_id, now),
             )
+            conn.commit()
+
+    def delete_cached_adset_id(self, campaign_id: str, batch_id: str, bucket: int) -> None:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("DELETE FROM adset_cache WHERE campaign_id=? AND batch_id=? AND bucket=?", (campaign_id, batch_id, int(bucket)))
             conn.commit()
 
     def get(self, key: str) -> Optional[dict]:
@@ -267,6 +277,12 @@ class IdempotencyStore:
                     ids.get("ad_id"),
                 ),
             )
+            conn.commit()
+
+    def delete_launch(self, key: str) -> None:
+        """Delete a stored launch key so a subsequent run can recreate it."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("DELETE FROM launches_v2 WHERE launch_key=?", (key,))
             conn.commit()
 
 
@@ -551,7 +567,7 @@ class MetaClient:
 
         # Prefer server-side filtering if supported.
         params = {
-            "fields": "id,name",
+            "fields": "id,name,status,effective_status",
             "limit": str(limit),
             "filtering": json.dumps([
                 {"field": "name", "operator": "EQUAL", "value": name}
@@ -559,6 +575,10 @@ class MetaClient:
         }
         rows = self._get_all_pages(f"/{acct}/campaigns", params=params)
         for r in rows:
+            eff = (r.get("effective_status") or r.get("status") or "").strip().upper()
+            if eff in {"ARCHIVED", "DELETED"}:
+                continue
+
             if (r.get("name") or "").strip() == name and r.get("id"):
                 return str(r["id"])
         return None
@@ -570,7 +590,7 @@ class MetaClient:
             return None
 
         params = {
-            "fields": "id,name",
+            "fields": "id,name,status,effective_status",
             "limit": str(limit),
             "filtering": json.dumps([
                 {"field": "name", "operator": "EQUAL", "value": name}
@@ -578,6 +598,10 @@ class MetaClient:
         }
         rows = self._get_all_pages(f"/{cid}/adsets", params=params)
         for r in rows:
+            eff = (r.get("effective_status") or r.get("status") or "").strip().upper()
+            if eff in {"ARCHIVED", "DELETED"}:
+                continue
+
             if (r.get("name") or "").strip() == name and r.get("id"):
                 return str(r["id"])
         return None
@@ -873,6 +897,20 @@ def build_adset_name(product: str, batch_id: str, bucket: int) -> str:
     return f"{product.upper()} | {batch_id} | {bucket:02d}"
 
 
+
+
+_BAD_EFFECTIVE_STATUSES = {'ARCHIVED', 'DELETED'}
+
+def is_meta_object_usable(client: 'MetaClient', object_id: str) -> bool:
+    """Returns True if object is usable (not archived/deleted)."""
+    try:
+        obj = client.get_object(object_id, fields='id,status,effective_status')
+    except Exception:
+        # If we can't read it, treat as unusable to force re-create.
+        return False
+    eff = (obj.get('effective_status') or obj.get('status') or '').strip().upper()
+    return eff not in _BAD_EFFECTIVE_STATUSES
+
 # -----------------------------
 # Orchestration
 # -----------------------------
@@ -970,8 +1008,22 @@ def run_launch_plan(
 
     existing = store.get(launch_key)
     if existing:
-        print(f"[IDEMPOTENT HIT] Found existing launch for key={launch_key}")
-        return existing
+        # Mode 1 (recommended): verify the stored result still exists in Meta and is usable.
+        # This prevents the local store from "blocking" a rerun if you deleted/archived objects in Ads Manager.
+        if dry_run:
+            print(f"[IDEMPOTENT HIT] Found existing launch for key={launch_key}")
+            return existing
+
+        ad_id = existing.get("ad_id")
+        if ad_id and is_meta_object_usable(client, str(ad_id)):
+            print(f"[IDEMPOTENT HIT] Found existing launch for key={launch_key}")
+            return existing
+
+        # Stale hit: the ad is missing or archived/deleted in Meta. Ignore the cached launch and recreate.
+        print(
+            f"[IDEMPOTENT STALE] Local launch exists but Meta ad is missing/archived; recreating for key={launch_key}"
+        )
+        store.delete_launch(launch_key)
 
     # 1) Upload image if needed
     image_hash: Optional[str] = None
@@ -1006,19 +1058,69 @@ def run_launch_plan(
 
     # 2) Get-or-create campaign based on product
     campaign_name = resolve_campaign_name(plan.product)
+
+    # Optional: persist campaign IDs per product in Postgres (Railway) so archived IDs don't get reused.
+    # Enable with: CAMPAIGN_ROUTE_SOURCE=db and DATABASE_URL
+    database_url = (os.getenv("DATABASE_URL") or "").strip()
+    campaign_route_source = (os.getenv("CAMPAIGN_ROUTE_SOURCE") or "").strip().lower()
+    use_campaign_db = bool(database_url) and campaign_route_source == "db"
+
+    if use_campaign_db:
+        from campaign_store import (
+            ensure_campaign_routes_table,
+            get_campaign_id,
+            upsert_campaign_id,
+            clear_campaign_id,
+        )
+        ensure_campaign_routes_table(database_url)
+
     if dry_run:
         print(f"[DRY RUN] get-or-create campaign for product={plan.product} name={campaign_name!r}")
         campaign_id = "DRY_RUN_CAMPAIGN_ID"
     else:
-        campaign_id = store.get_cached_campaign_id(plan.product)
+        campaign_id = None
+
+        # (A) DB route (highest priority)
+        if use_campaign_db:
+            campaign_id = get_campaign_id(database_url, plan.product)
+            if campaign_id and not is_meta_object_usable(client, campaign_id):
+                clear_campaign_id(database_url, plan.product)
+                campaign_id = None
+
+        # (B) Local cache
+        if not campaign_id:
+            campaign_id = store.get_cached_campaign_id(plan.product)
+            if campaign_id and not is_meta_object_usable(client, campaign_id):
+                store.delete_cached_campaign_id(plan.product)
+                campaign_id = None
+
+        # (C) Meta lookup by name (ignores archived/deleted in helper)
         if not campaign_id:
             campaign_id = client.find_campaign_id_by_name(campaign_name)
             if campaign_id:
                 store.put_cached_campaign_id(plan.product, campaign_name, campaign_id)
+                if use_campaign_db:
+                    upsert_campaign_id(database_url, plan.product, campaign_id)
+
+        # (D) Create new if still missing
         if not campaign_id:
             campaign_spec = plan.campaign.model_copy(update={"name": campaign_name})
             campaign_id = client.create_campaign(campaign_spec, dry_run=False)
             store.put_cached_campaign_id(plan.product, campaign_name, campaign_id)
+            if use_campaign_db:
+                upsert_campaign_id(database_url, plan.product, campaign_id)
+
+        # Final safety: never proceed with an archived/deleted campaign
+        if campaign_id and not is_meta_object_usable(client, campaign_id):
+            if use_campaign_db:
+                clear_campaign_id(database_url, plan.product)
+            store.delete_cached_campaign_id(plan.product)
+
+            campaign_spec = plan.campaign.model_copy(update={"name": campaign_name})
+            campaign_id = client.create_campaign(campaign_spec, dry_run=False)
+            store.put_cached_campaign_id(plan.product, campaign_name, campaign_id)
+            if use_campaign_db:
+                upsert_campaign_id(database_url, plan.product, campaign_id)
 
     # 3) Get-or-create adset: group variants of 5 into a bucket
     batch_id, bucket = parse_batch_and_bucket(plan.creative.name)
@@ -1029,14 +1131,25 @@ def run_launch_plan(
         adset_id = "DRY_RUN_ADSET_ID"
     else:
         adset_id = store.get_cached_adset_id(campaign_id, batch_id, bucket)
+        if adset_id and not is_meta_object_usable(client, adset_id):
+            store.delete_cached_adset_id(campaign_id, batch_id, bucket)
+            adset_id = None
+
         if not adset_id:
             adset_id = client.find_adset_id_by_name(campaign_id, adset_name)
             if adset_id:
                 store.put_cached_adset_id(campaign_id, batch_id, bucket, adset_name, adset_id)
+
+        # Extra safety: never proceed with archived/deleted adsets
+        if adset_id and not is_meta_object_usable(client, adset_id):
+            store.delete_cached_adset_id(campaign_id, batch_id, bucket)
+            adset_id = None
+
         if not adset_id:
             adset_spec = plan.adset.model_copy(update={"name": adset_name})
             adset_id = client.create_adset(adset_spec, campaign_id=campaign_id, dry_run=False)
             store.put_cached_adset_id(campaign_id, batch_id, bucket, adset_name, adset_id)
+
     # 4) Create creative
     creative_id = client.create_adcreative(plan.creative, dry_run=dry_run)
     # 5) Create ad
