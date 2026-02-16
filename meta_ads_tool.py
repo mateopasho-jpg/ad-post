@@ -402,6 +402,13 @@ class AdSetSpec(BaseModel):
             self.is_adset_budget_sharing_enabled = False
 
         return self
+    
+    @model_validator(mode="after")
+    def _normalize_empty_strings(self) -> "AdSetSpec":
+        # Make dataStructure often sends "" instead of omitting fields
+        if self.bid_strategy is not None and not str(self.bid_strategy).strip():
+            self.bid_strategy = None
+        return self
 
 
 class CreativeSpec(BaseModel):
@@ -880,8 +887,11 @@ class MetaClient:
         # Bid settings
         if spec.bid_amount is not None:
             data["bid_amount"] = str(spec.bid_amount)
-        if spec.bid_strategy is not None:
-            data["bid_strategy"] = spec.bid_strategy
+
+        # only send bid_strategy if it's non-empty
+        if spec.bid_strategy:
+            data["bid_strategy"] = str(spec.bid_strategy).strip()
+
 
         # Schedule
         if spec.start_time is not None:
