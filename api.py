@@ -27,7 +27,9 @@ Optional:
 - META_APP_SECRET
 - META_TOKEN_SOURCE ("db" to read token from DB)
 - DATABASE_URL (required if META_TOKEN_SOURCE=db)
-- IDEMPOTENCY_DB_PATH (default: .meta_idempotency.db)
+- IDEMPOTENCY_DB_PATH (default: .meta_idempotency.db; ignored if IDEMPOTENCY_STORE_SOURCE=db)
+- IDEMPOTENCY_STORE_SOURCE (set to "db" to store idempotency in Postgres)
+- QUEUE_STORE_SOURCE (set to "db" to store batching queue in Postgres)
 - SERVICE_API_KEY (if set, enforces X-API-Key)
 
 Notes

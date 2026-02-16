@@ -1,24 +1,13 @@
 # Meta Ads Test Project (Python)
 
-This project contains a **Meta Marketing API test harness** plus a **minimal HTTP API** wrapper so tools like Make.com can trigger launches.
+This repo is a **Meta Marketing API test harness** plus a **minimal HTTP API** wrapper so tools like Make.com / Notion can trigger launches.
 
-It supports a local CLI for quick testing, and an API mode for deployment.
-- Verify your token + account connections are correct
-- Verify you can create/update campaigns/adsets/ads without duplicates
-- Only then wire it into Make → Node/Python backend → Notion status sync
+It supports:
+- a local CLI for testing
+- an API mode for deployment
+- local idempotency (`.meta_idempotency.db`)
 
-## What you can do with this project
-
-- Validate token (GET /me)
-- List ad accounts you can access
-- Inspect an ad account
-- Upload an image and get `image_hash`
-- Create:
-  - Campaign → AdSet → AdCreative → Ad
-- Read objects (campaign/adset/ad/creative)
-- Pause/Activate objects
-- Update AdSet budget
-- Local idempotency via SQLite file (`.meta_idempotency.db`)
+---
 
 ## Install
 
@@ -40,11 +29,13 @@ cp config.example.env .env
 Fill in at least:
 - `META_ACCESS_TOKEN`
 - `META_AD_ACCOUNT_ID` (can be `act_123...` or just `123...`)
-- optional: `META_API_VERSION` (defaults to v21.0)
 
-Optional (recommended for production):
+Optional (recommended):
 - `SERVICE_API_KEY` (if set, /run requires header `X-API-Key: <SERVICE_API_KEY>`)
-- `IDEMPOTENCY_DB_PATH` (where the SQLite idempotency DB is stored)
+- `IDEMPOTENCY_DB_PATH` (path for `.meta_idempotency.db`)
+- `QUEUE_DB_PATH` (path for `.queue_state.db`)
+
+---
 
 ## Quick start
 
@@ -53,6 +44,8 @@ python meta_ads_tool.py whoami
 python meta_ads_tool.py list-adaccounts
 python meta_ads_tool.py adaccount
 ```
+
+---
 
 ## Run as an API (for Make.com)
 
@@ -77,7 +70,7 @@ curl -X POST http://localhost:8080/run \
   -d '{
     "job_id": "local-test",
     "dry_run": true,
-    "plan": '"$(cat examples/traffic_image_ad.json)"'
+    "plan": '"$(cat examples/traffic_image_ad_v2.json)"'
   }'
 ```
 
@@ -85,82 +78,212 @@ Notes:
 - If you do not set `SERVICE_API_KEY`, you can omit the `X-API-Key` header.
 - For automation (Notion/Make), prefer `assets.image_url` over `assets.image_path`.
 
-Routing:
-- `plan.product` is required (`green`, `lila`, `rosa`). The backend will **route the ad into the corresponding product campaign**.
-- You can configure the canonical campaign names via `PRODUCT_CAMPAIGN_NAMES` (JSON string), e.g.
-  `{"green":"GREEN | Main","lila":"LILA | Main","rosa":"ROSA | Main"}`.
-- AdSets are auto-chosen from `plan.creative.name` by grouping variants in buckets of 5 (see below).
+---
 
-### Find your Page ID / IG actor ID (optional but usually needed for creatives)
+## Schema v2 (current) — naming + batching
+
+> Use `schema_version: 2` in the LaunchPlan.
+
+### Countries field (Notion multi-select)
+
+You can provide countries either as a list or a comma-separated string:
+
+```json
+"countries": ["AT", "DE"]
+```
+
+This automatically overwrites:
+`adset.targeting.geo_locations.countries`.
+
+### Naming convention
+
+**Campaign name**
+
+```
+VFB // <Product Label> // #<Product Code># // <Variant Label> // WC // ABO // Lowest Cost
+```
+
+Variant labels default to:
+- green: `TESTING`, `GRAFIK TESTING`
+- lila: `TESTING`, `GRAFIK TESTING`
+- rosa: `TESTING`
+
+**Ad Set name**
+
+```
+<NNNN> Test // VFB // #<Product Code># // <Product Label> // <Audience> // Batch
+```
+
+`<NNNN>` is auto-incremented by scanning existing AdSets in the product's campaign(s).
+
+**Ad name**
+
+```
+<NotionNumber>_<Variant>_<Product Label> // Video // Mehr dazu // <Offer Page>
+```
+
+### AdSet creation logic (3–4 ads, category separation)
+
+- Items are queued per `(product, category, adset_signature)`.
+- An AdSet is created **only when at least 3 unique video IDs** are available.
+- Each AdSet contains **up to 4** unique video IDs.
+- Remaining items are automatically split into the next AdSet.
+- `category` must be `ai` or `ug`. AI and UG are **never mixed** in the same AdSet.
+
+**Video variants rule**
+
+The backend treats the leading number in `creative.name` as the **video identifier** (e.g. `3452` in `3452_0_...`).
+Variants of the same video (e.g. `3452_0` and `3452_1`) are **not allowed in the same AdSet**.
+If duplicates are waiting in the queue, the API response will include:
+
+> `versions of the same video cannot go in the same AdSet`
+
+### Campaign selection for green/lila (50/50 split)
+
+- green and lila each use **two active campaigns**.
+- When creating a new AdSet, the backend picks the campaign with **fewer existing AdSets** (keeps them balanced).
+- rosa uses only one campaign.
+
+### Campaign ID DB (Railway Postgres)
+
+If you want to pin campaign IDs (recommended in production), set:
+
+```bash
+CAMPAIGN_ROUTE_SOURCE=db
+DATABASE_URL=postgres://...
+```
+
+Create/overwrite mappings by inserting rows into:
+
+`product_campaign_routes_v2(product, slot, campaign_id)`
+
+- `slot=1` and `slot=2` for green/lila
+- `slot=1` for rosa
+
+The code always checks this DB **first**.
+
+### Postgres queue + idempotency (recommended long-term on Railway)
+
+By default the project stores:
+- idempotency in a local SQLite file (`IDEMPOTENCY_DB_PATH`)
+- schema v2 batching queue in a local SQLite file (`QUEUE_DB_PATH`)
+
+For long-term Railway deployments (no volumes, safe restarts, optional multi-replica), switch both to Postgres:
+
+```bash
+DATABASE_URL=postgres://...
+QUEUE_STORE_SOURCE=db
+IDEMPOTENCY_STORE_SOURCE=db
+```
+
+Run this SQL once in your Railway Postgres:
+
+```sql
+CREATE TABLE IF NOT EXISTS queue_v2 (
+  id BIGSERIAL PRIMARY KEY,
+  product TEXT NOT NULL,
+  category TEXT NOT NULL,
+  signature TEXT NOT NULL,
+  video_id TEXT NOT NULL,
+  payload_json JSONB NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  state TEXT NOT NULL DEFAULT 'queued',
+  reserved_at TIMESTAMPTZ,
+  reserved_by TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_queue_v2_group
+  ON queue_v2(product, category, signature, id);
+
+CREATE TABLE IF NOT EXISTS launches_v2 (
+  launch_key TEXT PRIMARY KEY,
+  payload_sha256 TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  campaign_id TEXT,
+  adset_id TEXT,
+  creative_id TEXT,
+  ad_id TEXT
+);
+
+CREATE TABLE IF NOT EXISTS campaign_cache (
+  product TEXT PRIMARY KEY,
+  campaign_name TEXT NOT NULL,
+  campaign_id TEXT NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS adset_cache (
+  campaign_id TEXT NOT NULL,
+  batch_id TEXT NOT NULL,
+  bucket INTEGER NOT NULL,
+  adset_name TEXT NOT NULL,
+  adset_id TEXT NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (campaign_id, batch_id, bucket)
+);
+```
+
+Notes:
+- The queue uses a lightweight reservation mechanism to avoid double-processing.
+- If a request crashes mid-run, reserved rows automatically become eligible again after ~30 minutes.
+
+### URL parameters (hard-coded)
+
+Every creative gets these URL parameters appended automatically:
+
+```
+trc_mcmp_id={{campaign.id}}&trc_mag_id={{adset.id}}&trc_mad_id={{ad.id}}
+```
+
+---
+
+## Local dry run and full run
+
+Dry run (no Meta writes; safe):
+
+```bash
+python meta_ads_tool.py launch --plan examples/traffic_image_ad_v2.json --dry-run
+```
+
+Full run:
+
+```bash
+python meta_ads_tool.py launch --plan examples/traffic_image_ad_v2.json
+```
+
+> In schema v2 batching mode, each call **enqueues one item** and will only create an AdSet once 3+ unique videos are queued for that group.
+
+---
+
+## Useful helper commands
+
+Find your Page ID / IG actor ID (optional but usually needed for creatives):
 
 ```bash
 python meta_ads_tool.py promote-pages
 python meta_ads_tool.py instagram-accounts
 ```
 
-### Upload an image
+Upload an image:
 
 ```bash
 python meta_ads_tool.py upload-image --image-path ./my_image.jpg
 ```
 
-### Launch a full test ad (PAUSED)
-
-1. Open `examples/traffic_image_ad.json`
-2. Replace:
-   - `REPLACE_WITH_PAGE_ID`
-   - `REPLACE_WITH_IG_ACTOR_ID` (optional if you only run FB placements)
-   - `REPLACE_WITH_LOCAL_IMAGE_PATH.jpg`
-3. Run:
+Pause/Activate an object:
 
 ```bash
-python meta_ads_tool.py launch --plan examples/traffic_image_ad.json
+python meta_ads_tool.py set-status --id <ID> --status PAUSED
+python meta_ads_tool.py set-status --id <ID> --status ACTIVE
 ```
 
-Re-running the same plan will not create duplicates (local idempotency).
-
-### Product routing + adset bucketing
-
-Your LaunchPlan must include a `product` field (`green`, `lila`, or `rosa`).
-The backend routes each launch into a *canonical product campaign* (get-or-create by name), and then
-places ads into ad sets grouped by 5 creatives based on the pattern in `creative.name` (e.g. `3807_0_...`).
-
-You can override the campaign names via:
-
-```bash
-PRODUCT_CAMPAIGN_NAMES='{"green":"GREEN | Main Campaign","lila":"LILA | Main Campaign","rosa":"ROSA | Main Campaign"}'
-```
-
-### Using an image URL instead of a local path
-
-In automation flows, you typically won't have access to a local file path. Use `assets.image_url`:
-
-```json
-"assets": {
-  "image_url": "https://.../your-image.jpg"
-}
-```
-
-### Pause/Activate an ad
-
-```bash
-python meta_ads_tool.py set-status --id <AD_ID> --status PAUSED
-python meta_ads_tool.py set-status --id <AD_ID> --status ACTIVE
-```
-
-### Update AdSet budget
+Update AdSet budget:
 
 ```bash
 python meta_ads_tool.py update-adset-budget --adset-id <ADSET_ID> --daily-budget 1500
 ```
 
-> Budget values are in the smallest currency unit (for USD: cents).
-
-## Notes
-
-- This is for testing; keep everything `PAUSED` until you’re ready to spend.
-- The local idempotency db is *not* a replacement for the Notion idempotency key.
-  It just protects you while running tests locally.
+---
 
 ## Docker (deploy anywhere)
 
@@ -175,4 +298,3 @@ Run:
 ```bash
 docker run --rm -p 8080:8080 --env-file .env meta-ads-tool:latest
 ```
-

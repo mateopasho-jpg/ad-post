@@ -1,0 +1,72 @@
+{
+  "schema_version": 2,
+  "product": "green",
+  "category": "ug",
+  "product_label": "Grüne Helfer",
+  "product_code": "GH",
+  "audience": "M/W",
+  "offer_page": "LP259",
+  "countries": [
+    "AT",
+    "DE"
+  ],
+  "campaign": {
+    "name": "(auto)",
+    "objective": "OUTCOME_TRAFFIC",
+    "status": "PAUSED",
+    "special_ad_categories": []
+  },
+  "adset": {
+    "name": "(auto)",
+    "daily_budget": 1200,
+    "billing_event": "IMPRESSIONS",
+    "optimization_goal": "LINK_CLICKS",
+    "bid_strategy": "LOWEST_COST_WITHOUT_CAP",
+    "targeting": {
+      "geo_locations": {
+        "countries": [
+          "AT"
+        ]
+      },
+      "publisher_platforms": [
+        "facebook",
+        "instagram"
+      ],
+      "facebook_positions": [
+        "feed"
+      ],
+      "instagram_positions": [
+        "stream"
+      ],
+      "device_platforms": [
+        "mobile",
+        "desktop"
+      ]
+    },
+    "start_time": null,
+    "end_time": null
+  },
+  "creative": {
+    "name": "3823_0_Grüne Helfer",
+    "object_story_spec": {
+      "page_id": "999865253203298",
+      "link_data": {
+        "link": "https://example.com",
+        "message": "Example message",
+        "call_to_action": {
+          "type": "LEARN_MORE",
+          "value": {
+            "link": "https://example.com"
+          }
+        }
+      }
+    }
+  },
+  "ad": {
+    "name": "(auto)",
+    "status": "PAUSED"
+  },
+  "assets": {
+    "image_path": "examples/WhatsApp Image 2025-12-15 at 14.32.21.jpeg"
+  }
+}

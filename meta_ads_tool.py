@@ -45,6 +45,23 @@ import io
 from PIL import Image
 
 import requests
+
+# Hard-coded URL parameters appended to every ad creative.
+DEFAULT_URL_TAGS = 'trc_mcmp_id={{campaign.id}}&trc_mag_id={{adset.id}}&trc_mad_id={{ad.id}}'
+
+
+def merge_url_tags(existing: Optional[str]) -> str:
+    """Append DEFAULT_URL_TAGS to any existing url_tags string."""
+    base = (existing or "").strip()
+    if not base:
+        return DEFAULT_URL_TAGS
+    if DEFAULT_URL_TAGS in base:
+        return base
+    if base.endswith("&"):
+        return base + DEFAULT_URL_TAGS
+    return base + "&" + DEFAULT_URL_TAGS
+
+
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
@@ -286,6 +303,41 @@ class IdempotencyStore:
             conn.commit()
 
 
+def build_idempotency_store(store_path: str):
+    """Factory: SQLite (default) or Postgres (Railway).
+
+    Enable Postgres store by setting:
+      IDEMPOTENCY_STORE_SOURCE=db
+      DATABASE_URL=...
+    """
+    source = (os.getenv("IDEMPOTENCY_STORE_SOURCE") or "").strip().lower()
+    database_url = (os.getenv("DATABASE_URL") or "").strip()
+    if source == "db" and database_url:
+        from idempotency_store_pg import IdempotencyStorePG
+
+        return IdempotencyStorePG(database_url)
+    return IdempotencyStore(Path(store_path))
+
+
+def build_queue_store(queue_db_path: str):
+    """Factory: SQLite (default) or Postgres (Railway).
+
+    Enable Postgres queue by setting:
+      QUEUE_STORE_SOURCE=db
+      DATABASE_URL=...
+    """
+    source = (os.getenv("QUEUE_STORE_SOURCE") or "").strip().lower()
+    database_url = (os.getenv("DATABASE_URL") or "").strip()
+    if source == "db" and database_url:
+        from state_store_pg import StateStorePG
+
+        return StateStorePG(database_url)
+
+    from state_store import StateStore
+
+    return StateStore(queue_db_path)
+
+
 # -----------------------------
 # Plan models (strict JSON spec)
 # -----------------------------
@@ -355,6 +407,9 @@ class AdSetSpec(BaseModel):
 class CreativeSpec(BaseModel):
     name: str
     object_story_spec: Dict[str, Any]
+    # Meta Ads Manager: Tracking > URL Parameters
+    # In the API this is sent as AdCreative.url_tags
+    url_tags: Optional[str] = None
     degrees_of_freedom_spec: Optional[Dict[str, Any]] = None
 
 class AdSpec(BaseModel):
@@ -371,6 +426,43 @@ class LaunchPlan(BaseModel):
 
     # Required routing key (drives campaign selection)
     product: str = Field(description="Product key used for routing (green | lila | rosa).")
+
+    # NEW (schema_version >= 2): content/category bucketing
+    category: Optional[str] = Field(
+        default=None,
+        description="Content category used for AdSet batching (ai | ug). Required for schema_version >= 2.",
+    )
+
+    # NEW (schema_version >= 2): naming inputs (from Notion)
+    product_label: Optional[str] = Field(
+        default=None,
+        description="Human readable product name used in names (e.g. 'Grüne Helfer'). Required for schema_version >= 2.",
+    )
+    product_code: Optional[str] = Field(
+        default=None,
+        description="Short product code used in names without hash signs (e.g. 'GH'). Required for schema_version >= 2.",
+    )
+    audience: Optional[str] = Field(
+        default=None,
+        description="Audience label used in AdSet name (e.g. 'M/W', 'W- 20+'). Required for schema_version >= 2.",
+    )
+    offer_page: Optional[str] = Field(
+        default=None,
+        description="Offer page marker appended to Ad name (e.g. 'LP259' or a URL). Required for schema_version >= 2.",
+    )
+
+    # NEW: Notion multi-select support for countries.
+    # If provided, this overwrites adset.targeting.geo_locations.countries.
+    countries: Optional[List[str] | str] = Field(
+        default=None,
+        description="Country codes (e.g. ['AT','DE'] or 'AT,DE'). Optional; if present overrides targeting.geo_locations.countries.",
+    )
+
+    # NEW: batching mode (schema_version >= 2 defaults to True)
+    batching: Optional[bool] = Field(
+        default=None,
+        description="If true, the backend queues items and only creates AdSets when 3-4 unique videos are available (schema_version>=2).",
+    )
 
     campaign: CampaignSpec
     adset: AdSetSpec
@@ -391,6 +483,57 @@ class LaunchPlan(BaseModel):
         if v not in {"green", "lila", "rosa"}:
             raise ValueError("product must be one of: green, lila, rosa")
         self.product = v
+        return self
+
+    @model_validator(mode="after")
+    def _normalize_schema_and_inputs(self) -> "LaunchPlan":
+        # Default batching behavior
+        if self.batching is None:
+            self.batching = bool(self.schema_version >= 2)
+
+        # schema_version >= 2 requires additional Notion-derived fields
+        if self.schema_version >= 2:
+            cat = (self.category or "").strip().lower()
+            if cat not in {"ai", "ug"}:
+                raise ValueError("category must be one of: ai, ug (required for schema_version >= 2)")
+            self.category = cat
+
+            for field_name in ("product_label", "product_code", "audience", "offer_page"):
+                val = getattr(self, field_name)
+                if not (val or "").strip():
+                    raise ValueError(f"{field_name} is required for schema_version >= 2")
+                setattr(self, field_name, str(val).strip())
+
+            # Normalize countries: accept list or comma/space separated string
+            countries = self.countries
+            if isinstance(countries, str):
+                parts = [p.strip().upper() for p in re.split(r"[,\s]+", countries) if p.strip()]
+                self.countries = parts
+            elif isinstance(countries, list):
+                self.countries = [str(c).strip().upper() for c in countries if str(c).strip()]
+            elif countries is None:
+                self.countries = None
+
+            # If countries provided, overwrite targeting.geo_locations.countries
+            if self.countries:
+                geo = self.adset.targeting.get("geo_locations")
+                if not isinstance(geo, dict):
+                    geo = {}
+                    self.adset.targeting["geo_locations"] = geo
+                geo["countries"] = list(self.countries)
+
+        else:
+            # Keep old behavior: if schema_version=1, category/naming fields are ignored
+            self.category = self.category or None
+            self.product_label = self.product_label or None
+            self.product_code = self.product_code or None
+            self.audience = self.audience or None
+            self.offer_page = self.offer_page or None
+            self.countries = self.countries or None
+            if self.batching:
+                # Don't allow batching on legacy schema (would be missing required fields)
+                raise ValueError("batching is only supported for schema_version >= 2")
+
         return self
 
     @model_validator(mode="after")
@@ -606,6 +749,33 @@ class MetaClient:
                 return str(r["id"])
         return None
 
+    def list_adsets_in_campaign(self, campaign_id: str, *, fields: str = "id,name,status,effective_status", limit: int = 200, max_pages: int = 50) -> List[dict]:
+        cid = (campaign_id or "").strip()
+        if not cid:
+            return []
+        params = {"fields": fields, "limit": str(limit)}
+        return self._get_all_pages(f"/{cid}/adsets", params=params, max_pages=max_pages)
+
+    def count_adsets_in_campaign(self, campaign_id: str, *, max_pages: int = 50) -> int:
+        rows = self.list_adsets_in_campaign(campaign_id, fields="id", limit=200, max_pages=max_pages)
+        return len(rows)
+
+    def get_max_adset_prefix_number(self, campaign_id: str, *, prefix_re: re.Pattern, max_pages: int = 50) -> int:
+        """Parse AdSet name prefixes like '1028 Test // ...' and return max number."""
+        rows = self.list_adsets_in_campaign(campaign_id, fields="name", limit=200, max_pages=max_pages)
+        max_n = 0
+        for r in rows:
+            name = (r.get("name") or "").strip()
+            m = prefix_re.match(name)
+            if m:
+                try:
+                    n = int(m.group(1))
+                    if n > max_n:
+                        max_n = n
+                except Exception:
+                    pass
+        return max_n
+
     # -----------------------------
     # Create flow (image -> creative -> ad)
     # -----------------------------
@@ -749,6 +919,8 @@ class MetaClient:
             "name": spec.name,
             "object_story_spec": json.dumps(spec.object_story_spec),
         }
+        if spec.url_tags:
+            data["url_tags"] = spec.url_tags
         if spec.degrees_of_freedom_spec is not None:
             data["degrees_of_freedom_spec"] = json.dumps(spec.degrees_of_freedom_spec)
 
@@ -899,6 +1071,76 @@ def build_adset_name(product: str, batch_id: str, bucket: int) -> str:
 
 
 
+
+# -------------------------------------------------------------------------
+# V2 naming + batching helpers (schema_version >= 2)
+# -------------------------------------------------------------------------
+
+_VIDEO_NAME_RE_V2 = re.compile(r"^(?P<video>\d{4,})[_-](?P<variant>\d+)[_-](?P<label>.+)$")
+_ADSET_PREFIX_RE_V2 = re.compile(r"^(\d+)\s+Test\s+//")
+
+def parse_video_name_v2(name: str) -> tuple[str, int, str]:
+    """Parse '<videoId>_<variant>_<label>' and return (video_id, variant_index, label)."""
+    s = (name or "").strip()
+    m = _VIDEO_NAME_RE_V2.match(s)
+    if not m:
+        raise ValueError(
+            "creative.name must match '<videoId>_<variant>_<label>' (e.g., '3823_0_Grüne Helfer'). "
+            f"Got: {name!r}"
+        )
+    return m.group("video"), int(m.group("variant")), m.group("label").strip()
+
+def build_campaign_name_v2(product_label: str, product_code: str, variant_label: str) -> str:
+    return f"VFB // {product_label} // #{product_code}# // {variant_label} // WC // ABO // Lowest Cost"
+
+def resolve_campaign_variants_v2(product: str) -> list[str]:
+    """Return the campaign variant labels for a product.
+
+    Defaults:
+      - green: ["TESTING", "GRAFIK TESTING"]
+      - lila:  ["TESTING", "GRAFIK TESTING"]
+      - rosa:  ["TESTING"]
+
+    Override with:
+      PRODUCT_CAMPAIGN_VARIANTS='{"green":["TESTING","GRAFIK TESTING"],"lila":["TESTING","GRAFIK TESTING"],"rosa":["TESTING"]}'
+    """
+    product = (product or "").strip().lower()
+    raw = (os.getenv("PRODUCT_CAMPAIGN_VARIANTS") or "").strip()
+    if raw:
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict) and product in data and isinstance(data[product], list):
+                variants = [str(v).strip() for v in data[product] if str(v).strip()]
+                if variants:
+                    return variants
+        except Exception:
+            pass
+
+    defaults = {
+        "green": ["TESTING", "GRAFIK TESTING"],
+        "lila": ["TESTING", "GRAFIK TESTING"],
+        "rosa": ["TESTING"],
+    }
+    return defaults.get(product, ["TESTING"])
+
+def build_adset_name_v2(adset_number: int, product_label: str, product_code: str, audience: str) -> str:
+    return f"{adset_number} Test // VFB // #{product_code}# // {product_label} // {audience} // Batch"
+
+def build_ad_base_name_v2(video_id: str, variant: int, product_label: str) -> str:
+    return f"{video_id}_{variant}_{product_label}"
+
+def build_ad_name_v2(base_name: str, offer_page: str) -> str:
+    offer_page = (offer_page or "").strip()
+    return f"{base_name} // Video // Mehr dazu // {offer_page}"
+
+def compute_adset_signature_v2(adset_spec: 'AdSetSpec') -> str:
+    """Hash of adset_spec excluding name (prevents mixing different audiences/targeting)."""
+    data = adset_spec.model_dump()
+    data.pop("name", None)
+    raw = json.dumps(data, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
 _BAD_EFFECTIVE_STATUSES = {'ARCHIVED', 'DELETED'}
 
 def is_meta_object_usable(client: 'MetaClient', object_id: str) -> bool:
@@ -988,7 +1230,7 @@ def _fetch_and_normalize_image_bytes(url: str, *, timeout_s: int = 30) -> tuple[
 
 
 
-def run_launch_plan(
+def _run_launch_plan_v1(
     cfg: MetaConfig,
     plan: LaunchPlan,
     *,
@@ -997,7 +1239,10 @@ def run_launch_plan(
 ) -> dict:
     """Runs a validated LaunchPlan directly (API-friendly)."""
     client = MetaClient(cfg)
-    store = IdempotencyStore(Path(store_path))
+    store = build_idempotency_store(store_path)
+
+    # Always inject tracking URL parameters
+    plan.creative.url_tags = merge_url_tags(plan.creative.url_tags)
 
     # Deterministic internal key (no idempotency_key field required from clients)
     launch_key_raw = f"{plan.product}::{plan.creative.name}::{plan.ad.name}".encode("utf-8")
@@ -1067,12 +1312,12 @@ def run_launch_plan(
 
     if use_campaign_db:
         from campaign_store import (
-            ensure_campaign_routes_table,
-            get_campaign_id,
-            upsert_campaign_id,
-            clear_campaign_id,
+            ensure_campaign_routes_table_v1,
+            get_campaign_id_v1,
+            upsert_campaign_id_v1,
+            clear_campaign_id_v1,
         )
-        ensure_campaign_routes_table(database_url)
+        ensure_campaign_routes_table_v1(database_url)
 
     if dry_run:
         print(f"[DRY RUN] get-or-create campaign for product={plan.product} name={campaign_name!r}")
@@ -1082,9 +1327,9 @@ def run_launch_plan(
 
         # (A) DB route (highest priority)
         if use_campaign_db:
-            campaign_id = get_campaign_id(database_url, plan.product)
+            campaign_id = get_campaign_id_v1(database_url, plan.product)
             if campaign_id and not is_meta_object_usable(client, campaign_id):
-                clear_campaign_id(database_url, plan.product)
+                clear_campaign_id_v1(database_url, plan.product)
                 campaign_id = None
 
         # (B) Local cache
@@ -1100,7 +1345,7 @@ def run_launch_plan(
             if campaign_id:
                 store.put_cached_campaign_id(plan.product, campaign_name, campaign_id)
                 if use_campaign_db:
-                    upsert_campaign_id(database_url, plan.product, campaign_id)
+                    upsert_campaign_id_v1(database_url, plan.product, campaign_id)
 
         # (D) Create new if still missing
         if not campaign_id:
@@ -1108,19 +1353,19 @@ def run_launch_plan(
             campaign_id = client.create_campaign(campaign_spec, dry_run=False)
             store.put_cached_campaign_id(plan.product, campaign_name, campaign_id)
             if use_campaign_db:
-                upsert_campaign_id(database_url, plan.product, campaign_id)
+                upsert_campaign_id_v1(database_url, plan.product, campaign_id)
 
         # Final safety: never proceed with an archived/deleted campaign
         if campaign_id and not is_meta_object_usable(client, campaign_id):
             if use_campaign_db:
-                clear_campaign_id(database_url, plan.product)
+                clear_campaign_id_v1(database_url, plan.product)
             store.delete_cached_campaign_id(plan.product)
 
             campaign_spec = plan.campaign.model_copy(update={"name": campaign_name})
             campaign_id = client.create_campaign(campaign_spec, dry_run=False)
             store.put_cached_campaign_id(plan.product, campaign_name, campaign_id)
             if use_campaign_db:
-                upsert_campaign_id(database_url, plan.product, campaign_id)
+                upsert_campaign_id_v1(database_url, plan.product, campaign_id)
 
     # 3) Get-or-create adset: group variants of 5 into a bucket
     batch_id, bucket = parse_batch_and_bucket(plan.creative.name)
@@ -1177,6 +1422,345 @@ def run_launch_plan(
     return result
 
 
+
+
+
+
+
+def _run_launch_plan_v2(
+    cfg: MetaConfig,
+    plan: LaunchPlan,
+    *,
+    store_path: str = ".meta_idempotency.db",
+    dry_run: bool = False,
+) -> dict:
+    """Schema v2 batching mode:
+    - enqueue one LaunchPlan payload (one Notion entry)
+    - once we have 3-4 *unique* video_ids for the (product, category, adset_signature) group,
+      create a new AdSet and launch ads into it.
+    """
+    from campaign_store import (
+        ensure_campaign_routes_table,
+        get_campaign_ids,
+        upsert_campaign_id,
+        clear_campaign_id,
+    )
+
+    client = MetaClient(cfg)
+    store = build_idempotency_store(store_path)
+
+    # Ensure URL tags are always present (hard-coded tracking line)
+    plan.creative.url_tags = merge_url_tags(plan.creative.url_tags)
+
+    queue_db_path = (os.getenv("QUEUE_DB_PATH") or ".queue_state.db").strip() or ".queue_state.db"
+    qstore = build_queue_store(queue_db_path)
+
+    # Parse video id from the base name (Notion number prefix).
+    video_id, variant, _label = parse_video_name_v2(plan.creative.name)
+
+    # Group signature: prevent mixing different audiences/targeting.
+    sig = compute_adset_signature_v2(plan.adset)
+    sig = f"{sig}:{(plan.audience or '').strip()}"
+
+    row_id = qstore.enqueue(
+        product=plan.product,
+        category=plan.category or "ug",
+        signature=sig,
+        video_id=video_id,
+        payload=plan.model_dump(),
+    )
+
+    # Collect queued items for this group.
+    rows = qstore.fetch_group(product=plan.product, category=plan.category or "ug", signature=sig, limit=500)
+
+    # Helper: remove rows that already exist (idempotency) so they don't block batching.
+    def _is_row_already_launched(payload: dict) -> bool:
+        try:
+            p = LaunchPlan.model_validate(payload)
+        except Exception:
+            return False
+        base_name = p.creative.name
+        # Rebuild final names so launch_key is stable
+        vid, var, _ = parse_video_name_v2(base_name)
+        base = build_ad_base_name_v2(vid, var, p.product_label or "")
+        ad_name = build_ad_name_v2(base, p.offer_page or "")
+        launch_key_raw = f"{p.product}::{base}::{ad_name}".encode("utf-8")
+        launch_key = "launch:" + hashlib.sha256(launch_key_raw).hexdigest()[:24]
+        existing = store.get(launch_key)
+        if not existing:
+            return False
+        if dry_run:
+            return True
+        ad_id = existing.get("ad_id")
+        return bool(ad_id and is_meta_object_usable(client, str(ad_id)))
+
+    stale_ids: List[int] = []
+    for r in rows:
+        if _is_row_already_launched(r.payload):
+            stale_ids.append(r.id)
+    if stale_ids and not dry_run:
+        qstore.delete_ids(stale_ids)
+        rows = [r for r in rows if r.id not in set(stale_ids)]
+
+    # Compute uniqueness
+    by_video: Dict[str, List[int]] = {}
+    for r in rows:
+        by_video.setdefault(r.video_id, []).append(r.id)
+
+    duplicates = sorted([vid for vid, ids in by_video.items() if len(ids) > 1])
+    unique_video_ids = [vid for vid in by_video.keys()]
+
+    MIN_PER_ADSET = 3
+    MAX_PER_ADSET = 4
+
+    if len(unique_video_ids) < MIN_PER_ADSET:
+        msg = f"Queued (need {MIN_PER_ADSET} unique videos, currently {len(unique_video_ids)})."
+        if duplicates:
+            msg += " Note: versions of the same video cannot go in the same AdSet; duplicates in queue: " + ", ".join(duplicates)
+        return {
+            "mode": "batch",
+            "queued": True,
+            "queue_row_id": row_id,
+            "product": plan.product,
+            "category": plan.category,
+            "signature": sig,
+            "unique_videos_in_queue": len(unique_video_ids),
+            "duplicates_in_queue": duplicates,
+            "message": msg,
+        }
+
+    # Resolve campaign IDs (DB first), then balance between the two campaigns for green/lila.
+    route_source = (os.getenv("CAMPAIGN_ROUTE_SOURCE") or "").strip().lower()
+    database_url = (os.getenv("DATABASE_URL") or "").strip() or None
+
+    required_slots = 2 if plan.product in {"green", "lila"} else 1
+    variant_labels = resolve_campaign_variants_v2(plan.product)
+
+    ids_by_slot: Dict[int, str] = {}
+    if route_source == "db" and database_url:
+        ensure_campaign_routes_table(database_url)
+        ids_by_slot = get_campaign_ids(database_url, plan.product)
+
+    campaign_ids: List[str] = []
+    for slot in range(1, required_slots + 1):
+        cid = ids_by_slot.get(slot)
+        if cid and not dry_run:
+            # Validate that stored IDs are still usable
+            obj = client.get_object(cid, fields="id,name,status,effective_status")
+            eff = (obj.get("effective_status") or obj.get("status") or "").strip().upper()
+            if eff in _BAD_EFFECTIVE_STATUSES:
+                if database_url:
+                    clear_campaign_id(database_url, plan.product, slot=slot)
+                cid = None
+
+        if not cid:
+            variant_label = variant_labels[slot - 1] if slot - 1 < len(variant_labels) else variant_labels[0]
+            cname = build_campaign_name_v2(plan.product_label or "", plan.product_code or "", variant_label)
+            cid = client.find_campaign_id_by_name(cname)
+            if not cid:
+                camp_spec = plan.campaign.model_copy(deep=True)
+                camp_spec.name = cname
+                cid = client.create_campaign(camp_spec, dry_run=dry_run)
+            if route_source == "db" and database_url and cid and not dry_run:
+                upsert_campaign_id(database_url, plan.product, slot, cid)
+
+        campaign_ids.append(cid)
+
+    # Balance for green/lila by picking the campaign with fewer AdSets
+    chosen_campaign_id = campaign_ids[0]
+    if len(campaign_ids) > 1 and not dry_run:
+        counts = [(cid, client.count_adsets_in_campaign(cid)) for cid in campaign_ids]
+        counts.sort(key=lambda x: x[1])
+        chosen_campaign_id = counts[0][0]
+
+    # Determine next AdSet number (max across campaigns for this product)
+    next_adset_number = 1
+    if not dry_run:
+        max_n = 0
+        for cid in campaign_ids:
+            try:
+                n = client.get_max_adset_prefix_number(cid, prefix_re=_ADSET_PREFIX_RE_V2)
+                if n > max_n:
+                    max_n = n
+            except Exception:
+                pass
+        next_adset_number = max_n + 1
+
+    created_batches: List[dict] = []
+    remaining_rows = rows
+
+    # Keep creating AdSets as long as we have >=3 unique videos left.
+    safety = 0
+    while safety < 20:
+        safety += 1
+        # Recompute uniqueness each loop
+        seen: set[str] = set()
+        selected: List[Any] = []
+        for r in remaining_rows:
+            if r.video_id in seen:
+                continue
+            selected.append(r)
+            seen.add(r.video_id)
+            if len(selected) >= MAX_PER_ADSET:
+                break
+
+        if len(seen) < MIN_PER_ADSET:
+            break
+
+        # Reserve selected rows so concurrent requests / replicas don't double-process.
+        selected_ids = [int(r.id) for r in selected]
+        reserved_ids = selected_ids
+        if not dry_run and hasattr(qstore, "reserve_ids"):
+            try:
+                reserved_ids = list(qstore.reserve_ids(selected_ids))  # type: ignore[attr-defined]
+            except Exception:
+                reserved_ids = selected_ids
+
+            # If we couldn't reserve enough rows (race), refresh and try again.
+            if len(reserved_ids) < MIN_PER_ADSET:
+                remaining_rows = qstore.fetch_group(product=plan.product, category=plan.category or "ug", signature=sig, limit=500)
+                continue
+
+        try:
+            # Build AdSet name
+            adset_name = build_adset_name_v2(next_adset_number, plan.product_label or "", plan.product_code or "", plan.audience or "")
+            next_adset_number += 1
+
+            # Use first payload for AdSet spec (all same signature)
+            first_plan = LaunchPlan.model_validate(selected[0].payload)
+            adset_spec = first_plan.adset.model_copy(deep=True)
+            adset_spec.name = adset_name
+
+            if dry_run:
+                adset_id = "DRY_RUN_ADSET_ID"
+            else:
+                # NOTE: MetaClient.create_adset signature is (spec, campaign_id)
+                adset_id = client.create_adset(adset_spec, campaign_id=chosen_campaign_id, dry_run=False)
+
+            per_ad_results: List[dict] = []
+            processed_ids: List[int] = []
+
+            for r in selected:
+                # Skip rows we failed to reserve in a race
+                if not dry_run and hasattr(qstore, "reserve_ids") and int(r.id) not in set(reserved_ids):
+                    continue
+
+                p = LaunchPlan.model_validate(r.payload)
+                # Final naming
+                vid, var, _ = parse_video_name_v2(p.creative.name)
+                base_name = build_ad_base_name_v2(vid, var, p.product_label or "")
+                p.creative.name = base_name
+                p.creative.url_tags = merge_url_tags(p.creative.url_tags)
+                p.ad.name = build_ad_name_v2(base_name, p.offer_page or "")
+
+                # Idempotency key
+                launch_key_raw = f"{p.product}::{p.creative.name}::{p.ad.name}".encode("utf-8")
+                launch_key = "launch:" + hashlib.sha256(launch_key_raw).hexdigest()[:24]
+                plan_dict = p.model_dump()
+                payload_hash = sha256_json(plan_dict)
+
+                existing = store.get(launch_key)
+                if existing and (dry_run or (existing.get("ad_id") and is_meta_object_usable(client, str(existing.get("ad_id"))))):
+                    per_ad_results.append({"status": "skipped_existing", "launch_key": launch_key, **existing})
+                    processed_ids.append(r.id)
+                    continue
+
+                # Asset upload / image_hash injection (if needed)
+                image_hash: Optional[str] = None
+                if p.assets:
+                    if p.assets.image_hash:
+                        image_hash = p.assets.image_hash
+                    elif p.assets.image_path:
+                        if dry_run:
+                            image_hash = "DRY_RUN_IMAGE_HASH"
+                        else:
+                            image_hash = client.upload_image(image_path=p.assets.image_path)
+
+                if image_hash:
+                    # Inject into link_data if present
+                    oss = p.creative.object_story_spec
+                    link_data = oss.get("link_data") if isinstance(oss, dict) else None
+                    if isinstance(link_data, dict):
+                        link_data.setdefault("image_hash", image_hash)
+
+                # Create creative + ad
+                if dry_run:
+                    creative_id = "DRY_RUN_CREATIVE_ID"
+                    ad_id = "DRY_RUN_AD_ID"
+                else:
+                    creative_id = client.create_adcreative(p.creative, dry_run=False)
+                    # NOTE: MetaClient.create_ad signature is (spec, adset_id, creative_id)
+                    ad_id = client.create_ad(p.ad, adset_id=adset_id, creative_id=creative_id, dry_run=False)
+
+                result = {
+                    "launch_key": launch_key,
+                    "payload_sha256": payload_hash,
+                    "campaign_id": chosen_campaign_id,
+                    "adset_id": adset_id,
+                    "creative_id": creative_id,
+                    "ad_id": ad_id,
+                }
+                store.put(launch_key, payload_hash, result)
+                per_ad_results.append({"status": "created", **result})
+                processed_ids.append(r.id)
+
+            # Consume processed rows from the queue.
+            # We also consume in dry-run so repeated tests don't accumulate old items.
+            if processed_ids:
+                qstore.delete_ids(processed_ids)
+
+            created_batches.append(
+                {
+                    "campaign_id": chosen_campaign_id,
+                    "adset_id": adset_id,
+                    "adset_name": adset_name,
+                    "ads": per_ad_results,
+                }
+            )
+
+            # Refresh remaining rows
+            if processed_ids:
+                remaining_rows = [r for r in remaining_rows if r.id not in set(processed_ids)]
+            else:
+                break
+
+        except Exception:
+            # If something failed mid-batch, unreserve so we don't deadlock the queue.
+            if not dry_run and hasattr(qstore, "unreserve_ids") and reserved_ids:
+                try:
+                    qstore.unreserve_ids(reserved_ids)  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+            raise
+
+    msg = f"Launched {len(created_batches)} AdSet batch(es)."
+    if duplicates:
+        msg += " Note: versions of the same video cannot go in the same AdSet; duplicates in queue: " + ", ".join(duplicates)
+
+    return {
+        "mode": "batch",
+        "queued": False,
+        "product": plan.product,
+        "category": plan.category,
+        "signature": sig,
+        "duplicates_in_queue": duplicates,
+        "batches": created_batches,
+        "message": msg,
+    }
+
+
+
+def run_launch_plan(
+    cfg: MetaConfig,
+    plan: LaunchPlan,
+    *,
+    store_path: str = ".meta_idempotency.db",
+    dry_run: bool = False,
+) -> dict:
+    """Runs a validated LaunchPlan directly (API-friendly)."""
+    if plan.schema_version >= 2 and bool(plan.batching):
+        return _run_launch_plan_v2(cfg, plan, store_path=store_path, dry_run=dry_run)
+    return _run_launch_plan_v1(cfg, plan, store_path=store_path, dry_run=dry_run)
 
 
 # -----------------------------
@@ -1305,7 +1889,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 0
 
         if args.cmd == "launch":
-            run_launch(cfg, args.plan, store_path=args.store, dry_run=args.dry_run)
+            # Print the launch result so you can see queue/batch status and created IDs.
+            result = run_launch(cfg, args.plan, store_path=args.store, dry_run=args.dry_run)
+            print(json.dumps(result, indent=2, ensure_ascii=False))
             return 0
 
         if args.cmd == "get":
