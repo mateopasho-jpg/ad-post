@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "product": "green",
+
+  "campaign": {
+    "name": "IGNORED_IN_V1",
+    "objective": "OUTCOME_TRAFFIC",
+    "status": "PAUSED",
+    "special_ad_categories": []
+  },
+
+  "adset": {
+    "name": "IGNORED_IN_V1",
+    "billing_event": "IMPRESSIONS",
+    "optimization_goal": "LINK_CLICKS",
+    "status": "PAUSED",
+    "daily_budget": 1500,
+    "targeting": {
+      "geo_locations": { "countries": ["AT"] },
+      "age_min": 20,
+      "age_max": 65
+    }
+  },
+
+  "creative": {
+    "name": "3807_0_Grüne Helfer",
+    "object_story_spec": {
+      "page_id": "YOUR_PAGE_ID",
+      "link_data": {
+        "link": "https://example.com",
+        "message": "Test creative v1",
+        "call_to_action": { "type": "LEARN_MORE" },
+        "image_hash": "__FROM_UPLOAD__"
+      }
+    }
+  },
+
+  "ad": {
+    "name": "3807_0_Grüne Helfer - Local Test",
+    "status": "PAUSED"
+  },
+
+  "assets": {
+    "image_url": "https://your-public-image-url.com/image.jpg"
+  }
+}

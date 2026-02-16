@@ -6,10 +6,7 @@
   "product_code": "GH",
   "audience": "M/W",
   "offer_page": "LP259",
-  "countries": [
-    "AT",
-    "DE"
-  ],
+  "countries": ["AT", "DE"],
   "campaign": {
     "name": "(auto)",
     "objective": "OUTCOME_TRAFFIC",
@@ -23,25 +20,11 @@
     "optimization_goal": "LINK_CLICKS",
     "bid_strategy": "LOWEST_COST_WITHOUT_CAP",
     "targeting": {
-      "geo_locations": {
-        "countries": [
-          "AT"
-        ]
-      },
-      "publisher_platforms": [
-        "facebook",
-        "instagram"
-      ],
-      "facebook_positions": [
-        "feed"
-      ],
-      "instagram_positions": [
-        "stream"
-      ],
-      "device_platforms": [
-        "mobile",
-        "desktop"
-      ]
+      "geo_locations": { "countries": ["AT", "DE"] },
+      "publisher_platforms": ["facebook", "instagram"],
+      "facebook_positions": ["feed"],
+      "instagram_positions": ["stream"],
+      "device_platforms": ["mobile", "desktop"]
     },
     "start_time": null,
     "end_time": null
@@ -55,17 +38,13 @@
         "message": "Example message",
         "call_to_action": {
           "type": "LEARN_MORE",
-          "value": {
-            "link": "https://example.com"
-          }
-        }
+          "value": { "link": "https://example.com" }
+        },
+        "image_hash": "__FROM_UPLOAD__"
       }
     }
   },
-  "ad": {
-    "name": "(auto)",
-    "status": "PAUSED"
-  },
+  "ad": { "name": "(auto)", "status": "PAUSED" },
   "assets": {
     "image_url": "https://drive.google.com/file/d/1SmF0MFfaJGiQbG6U0IV4GR8yH9Nsqb_w/view?usp=sharing"
   }

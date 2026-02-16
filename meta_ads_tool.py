@@ -1088,7 +1088,10 @@ def parse_video_name_v2(name: str) -> tuple[str, int, str]:
             "creative.name must match '<videoId>_<variant>_<label>' (e.g., '3823_0_Grüne Helfer'). "
             f"Got: {name!r}"
         )
-    return m.group("video"), int(m.group("variant")), m.group("label").strip()
+    full_id = m.group("video")
+    video_id = full_id[:4]  # ✅ uniqueness is based on first 4 digits
+    return video_id, int(m.group("variant")), m.group("label").strip()
+
 
 def build_campaign_name_v2(product_label: str, product_code: str, variant_label: str) -> str:
     return f"VFB // {product_label} // #{product_code}# // {variant_label} // WC // ABO // Lowest Cost"
@@ -1188,7 +1191,7 @@ def _fetch_and_normalize_image_bytes(url: str, *, timeout_s: int = 30) -> tuple[
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/120.0 Safari/537.36"
         ),
-        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        "Accept": "image/jpeg,image/png,image/*;q=0.8,*/*;q=0.5",
         "Accept-Language": "en-US,en;q=0.9",
     }
 
@@ -1198,18 +1201,20 @@ def _fetch_and_normalize_image_bytes(url: str, *, timeout_s: int = 30) -> tuple[
     ct = (resp.headers.get("Content-Type") or "").lower()
     raw = resp.content or b""
 
-    # Guard: if it's tiny, it's not an image (prevents Meta file_size: 8)
+    # Guard: if it's tiny, it's almost certainly not an image (prevents Meta "file_size: 8")
     if len(raw) < 1024:
         raise ValueError(
             f"Downloaded content too small to be an image ({len(raw)} bytes). "
             f"content-type={ct} final_url={resp.url} preview={raw[:200]!r}"
         )
 
-    # Guard: HTML means "not actually an image"
-    if "text/html" in ct or raw[:20].lstrip().lower().startswith(b"<html"):
+    # Guard: HTML means "not actually an image" (Notion/Drive permission pages)
+    head = raw[:512].lstrip().lower()
+    if "text/html" in ct or head.startswith(b"<!doctype html") or head.startswith(b"<html"):
         raise ValueError(
             f"URL returned HTML, not an image. content-type={ct} final_url={resp.url} preview={raw[:200]!r}"
         )
+
 
     try:
         img = Image.open(io.BytesIO(raw))
@@ -1226,6 +1231,58 @@ def _fetch_and_normalize_image_bytes(url: str, *, timeout_s: int = 30) -> tuple[
 
     return jpeg_bytes, "image.jpg"
 
+def ensure_image_hash_for_plan(client, cfg, plan, *, dry_run: bool):
+    """
+    Ensures plan.assets.image_hash exists.
+    Supports: image_hash, image_path, image_url.
+    If image_url is used, downloads & normalizes to JPEG first.
+    Injects image_hash into creative.object_story_spec.link_data.image_hash.
+    Clears image_url/image_path so queued payload is stable.
+    """
+    # Nothing to do if no assets
+    if not getattr(plan, "assets", None):
+        return plan
+
+    # Already have hash
+    if getattr(plan.assets, "image_hash", None):
+        image_hash = plan.assets.image_hash
+    else:
+        image_hash = None
+
+        # Local file path (CLI/dev)
+        image_path = getattr(plan.assets, "image_path", None)
+        if image_path:
+            if dry_run:
+                image_hash = "DRY_RUN_IMAGE_HASH"
+            else:
+                image_hash = client.upload_image(image_path=image_path)
+
+        # Remote URL (Make-friendly)
+        image_url = getattr(plan.assets, "image_url", None)
+        if (not image_hash) and image_url:
+            if dry_run:
+                image_hash = "DRY_RUN_IMAGE_HASH"
+            else:
+                img_bytes, fname = _fetch_and_normalize_image_bytes(image_url, timeout_s=cfg.timeout_s)
+                image_hash = client.upload_image(image_bytes=img_bytes, filename=fname)
+
+    # If we resolved a hash, store it + inject into creative
+    if image_hash:
+        plan.assets.image_hash = image_hash
+        # Clear sources so queue doesn't store expiring URL/path
+        if hasattr(plan.assets, "image_url"):
+            plan.assets.image_url = None
+        if hasattr(plan.assets, "image_path"):
+            plan.assets.image_path = None
+
+        # Inject into creative.object_story_spec.link_data.image_hash
+        oss = plan.creative.object_story_spec
+        if isinstance(oss, dict):
+            link_data = oss.get("link_data")
+            if isinstance(link_data, dict):
+                link_data["image_hash"] = image_hash
+
+    return plan
 
 
 
@@ -1455,12 +1512,13 @@ def _run_launch_plan_v2(
     queue_db_path = (os.getenv("QUEUE_DB_PATH") or ".queue_state.db").strip() or ".queue_state.db"
     qstore = build_queue_store(queue_db_path)
 
-    # Parse video id from the base name (Notion number prefix).
     video_id, variant, _label = parse_video_name_v2(plan.creative.name)
 
-    # Group signature: prevent mixing different audiences/targeting.
     sig = compute_adset_signature_v2(plan.adset)
     sig = f"{sig}:{(plan.audience or '').strip()}"
+
+    # ✅ Resolve image_url/image_path -> image_hash BEFORE storing payload in queue
+    plan = ensure_image_hash_for_plan(client, cfg, plan, dry_run=dry_run)
 
     row_id = qstore.enqueue(
         product=plan.product,
@@ -1468,7 +1526,8 @@ def _run_launch_plan_v2(
         signature=sig,
         video_id=video_id,
         payload=plan.model_dump(),
-    )
+)
+
 
     # Collect queued items for this group.
     rows = qstore.fetch_group(product=plan.product, category=plan.category or "ug", signature=sig, limit=500)
@@ -1646,6 +1705,8 @@ def _run_launch_plan_v2(
                     continue
 
                 p = LaunchPlan.model_validate(r.payload)
+                p = ensure_image_hash_for_plan(client, cfg, p, dry_run=dry_run)
+
                 # Final naming
                 vid, var, _ = parse_video_name_v2(p.creative.name)
                 base_name = build_ad_base_name_v2(vid, var, p.product_label or "")
@@ -1665,24 +1726,6 @@ def _run_launch_plan_v2(
                     processed_ids.append(r.id)
                     continue
 
-                # Asset upload / image_hash injection (if needed)
-                image_hash: Optional[str] = None
-                if p.assets:
-                    if p.assets.image_hash:
-                        image_hash = p.assets.image_hash
-                    elif p.assets.image_path:
-                        if dry_run:
-                            image_hash = "DRY_RUN_IMAGE_HASH"
-                        else:
-                            image_hash = client.upload_image(image_path=p.assets.image_path)
-
-                if image_hash:
-                    # Inject into link_data if present
-                    oss = p.creative.object_story_spec
-                    link_data = oss.get("link_data") if isinstance(oss, dict) else None
-                    if isinstance(link_data, dict):
-                        link_data.setdefault("image_hash", image_hash)
-
                 # Create creative + ad
                 if dry_run:
                     creative_id = "DRY_RUN_CREATIVE_ID"
@@ -1700,7 +1743,9 @@ def _run_launch_plan_v2(
                     "creative_id": creative_id,
                     "ad_id": ad_id,
                 }
-                store.put(launch_key, payload_hash, result)
+                if not dry_run:
+                    store.put(launch_key, payload_hash, result)
+
                 per_ad_results.append({"status": "created", **result})
                 processed_ids.append(r.id)
 
