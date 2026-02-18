@@ -46,6 +46,131 @@ from PIL import Image
 
 import requests
 
+# -----------------------------
+# Batching policy (schema v2)
+# -----------------------------
+# Goal: Prefer 4 unique videos per AdSet; if we only have 3, wait a bit and then allow 3.
+# Defaults can be overridden via env vars (Railway-friendly):
+#   BATCH_TARGET=4
+#   BATCH_MIN=3
+#   BATCH_FALLBACK_AFTER_S=60
+#
+# IMPORTANT: "wait time" only works if something calls this service again
+# (or you run a worker that drains the queue periodically).
+
+@dataclass(frozen=True)
+class BatchPolicy:
+    target: int = 4
+    minimum: int = 3
+    fallback_after_s: int = 60  # 1 minute
+
+
+def get_batch_policy() -> BatchPolicy:
+    return BatchPolicy(
+        target=int(os.getenv("BATCH_TARGET", "4")),
+        minimum=int(os.getenv("BATCH_MIN", "3")),
+        fallback_after_s=int(os.getenv("BATCH_FALLBACK_AFTER_S", "60")),
+    )
+
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def decide_flush_size(unique_count: int, oldest_created_at: datetime, policy: BatchPolicy) -> int:
+    """Return the number of unique rows we should flush now (0 = don't flush yet)."""
+    age_s = (utcnow() - oldest_created_at).total_seconds()
+    if unique_count >= policy.target:
+        return policy.target
+    if unique_count >= policy.minimum and age_s >= policy.fallback_after_s:
+        return policy.minimum
+    return 0
+
+
+def _parse_iso_datetime_utc(s: str | None) -> datetime:
+    if not s:
+        return utcnow()
+    try:
+        s = str(s).strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return utcnow()
+
+
+def get_group_oldest_created_at(
+    qstore: Any,
+    *,
+    product: str,
+    category: str,
+    signature: str,
+    rows: Optional[List[Any]] = None,
+) -> datetime:
+    """Best-effort 'oldest created_at' for a queue group.
+
+    We try (in order):
+      1) QueueItem.created_at (if your store returns it)
+      2) Direct DB query against SQLite or Postgres backends (works with the current repo)
+      3) Fallback to now (disables the wait-time behavior)
+    """
+    # 1) If rows carry created_at, use that.
+    if rows:
+        cands: List[datetime] = []
+        for r in rows:
+            v = getattr(r, "created_at", None)
+            if isinstance(v, datetime):
+                cands.append(v.astimezone(timezone.utc) if v.tzinfo else v.replace(tzinfo=timezone.utc))
+            elif isinstance(v, str):
+                cands.append(_parse_iso_datetime_utc(v))
+        if cands:
+            return min(cands)
+
+    # 2) Query backend directly.
+    try:
+        # SQLite backend: StateStore has .db_path
+        db_path = getattr(qstore, "db_path", None)
+        if db_path:
+            with sqlite3.connect(str(db_path)) as conn:
+                cur = conn.execute(
+                    """
+                    SELECT MIN(created_at)
+                    FROM queue_v2
+                    WHERE product=? AND category=? AND signature=?
+                    """,
+                    (product, category, signature),
+                )
+                row = cur.fetchone()
+            return _parse_iso_datetime_utc(row[0] if row else None)
+
+        # Postgres backend: StateStorePG has .database_url and .table
+        database_url = getattr(qstore, "database_url", None)
+        table = getattr(qstore, "table", "queue_v2")
+        if database_url:
+            import psycopg  # local import so SQLite-only installs still work
+
+            with psycopg.connect(database_url) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"""
+                        SELECT MIN(created_at)
+                        FROM {table}
+                        WHERE product=%s AND category=%s AND signature=%s
+                          AND (
+                            state='queued'
+                            OR (state='reserved' AND reserved_at < (now() - interval '30 minutes'))
+                          )
+                        """,
+                        (product, category, signature),
+                    )
+                    row = cur.fetchone()
+            return row[0].astimezone(timezone.utc) if row and row[0] else utcnow()
+    except Exception:
+        pass
+
+    return utcnow()
+
 # Hard-coded URL parameters appended to every ad creative.
 DEFAULT_URL_TAGS = 'trc_mcmp_id={{campaign.id}}&trc_mag_id={{adset.id}}&trc_mad_id={{ad.id}}'
 
@@ -1494,6 +1619,407 @@ def _run_launch_plan_v1(
 
 
 
+
+
+def _drain_queue_group_v2(
+    cfg: MetaConfig,
+    *,
+    qstore: Any,
+    store: Any,
+    product: str,
+    category: str,
+    signature: str,
+    dry_run: bool = False,
+) -> dict:
+    """Drain (flush) a single v2 queue group.
+
+    This is the same batching logic used by the /run endpoint, but without enqueuing.
+    It enables a separate worker process to periodically flush groups once the
+    time-based fallback becomes eligible (e.g. allow 3 after 60s).
+    """
+    from campaign_store import (
+        ensure_campaign_routes_table,
+        get_campaign_ids,
+        upsert_campaign_id,
+        clear_campaign_id,
+    )
+
+    client = MetaClient(cfg)
+    policy = get_batch_policy()
+
+    # Load group rows
+    rows = qstore.fetch_group(product=product, category=category, signature=signature, limit=500)
+    if not rows:
+        return {
+            "mode": "batch",
+            "queued": True,
+            "product": product,
+            "category": category,
+            "signature": signature,
+            "message": "No queued rows for this group.",
+        }
+
+    # Helper: remove rows that already exist (idempotency) so they don't block batching.
+    def _is_row_already_launched(payload: dict) -> bool:
+        try:
+            p = LaunchPlan.model_validate(payload)
+        except Exception:
+            return False
+        base_name = p.creative.name
+        # Rebuild final names so launch_key is stable
+        vid, var, _ = parse_video_name_v2(base_name)
+        base = build_ad_base_name_v2(vid, var, p.product_label or "")
+        ad_name = build_ad_name_v2(base, p.offer_page or "")
+        launch_key_raw = f"{p.product}::{base}::{ad_name}".encode("utf-8")
+        launch_key = "launch:" + hashlib.sha256(launch_key_raw).hexdigest()[:24]
+        existing = store.get(launch_key)
+        if not existing:
+            return False
+        if dry_run:
+            return True
+        ad_id = existing.get("ad_id")
+        return bool(ad_id and is_meta_object_usable(client, str(ad_id)))
+
+    stale_ids = [r.id for r in rows if _is_row_already_launched(r.payload)]
+    if stale_ids and not dry_run:
+        qstore.delete_ids(stale_ids)
+        rows = [r for r in rows if r.id not in set(stale_ids)]
+        if not rows:
+            return {
+                "mode": "batch",
+                "queued": True,
+                "product": product,
+                "category": category,
+                "signature": signature,
+                "message": "Group rows were all already launched; queue cleaned.",
+            }
+
+    # Validate group invariants (safety): product_label/product_code/audience must match.
+    group_plans = []
+    for r in rows[:10]:
+        try:
+            group_plans.append(LaunchPlan.model_validate(r.payload))
+        except Exception:
+            pass
+    if not group_plans:
+        return {
+            "mode": "batch",
+            "queued": True,
+            "product": product,
+            "category": category,
+            "signature": signature,
+            "message": "Could not parse LaunchPlan payloads in this group.",
+        }
+
+    group_plan = group_plans[0]
+    keyset = {(p.product_label, p.product_code, p.audience) for p in group_plans}
+    if len(keyset) > 1:
+        return {
+            "mode": "batch",
+            "queued": True,
+            "product": product,
+            "category": category,
+            "signature": signature,
+            "message": "Safety stop: mixed product_label/product_code/audience detected inside the same group. Fix signature/grouping.",
+            "samples": [
+                {"product_label": p.product_label, "product_code": p.product_code, "audience": p.audience}
+                for p in group_plans
+            ],
+        }
+
+    # Compute uniqueness
+    by_video: Dict[str, List[int]] = {}
+    for r in rows:
+        by_video.setdefault(r.video_id, []).append(r.id)
+
+    duplicates = sorted([vid for vid, ids in by_video.items() if len(ids) > 1])
+    unique_video_ids = list(by_video.keys())
+
+    oldest_created_at = get_group_oldest_created_at(
+        qstore,
+        product=product,
+        category=category,
+        signature=signature,
+        rows=rows,
+    )
+    flush_size = decide_flush_size(len(unique_video_ids), oldest_created_at, policy)
+
+    if flush_size == 0:
+        age_s = int((utcnow() - oldest_created_at).total_seconds())
+        msg = (
+            f"Queued (aim {policy.target} unique; allow {policy.minimum} after {policy.fallback_after_s}s). "
+            f"Unique={len(unique_video_ids)}, oldest_age_s={age_s}."
+        )
+        if duplicates:
+            msg += " Duplicates in queue: " + ", ".join(duplicates)
+        return {
+            "mode": "batch",
+            "queued": True,
+            "product": product,
+            "category": category,
+            "signature": signature,
+            "unique_videos_in_queue": len(unique_video_ids),
+            "duplicates_in_queue": duplicates,
+            "oldest_age_s": age_s,
+            "policy": {
+                "target": policy.target,
+                "minimum": policy.minimum,
+                "fallback_after_s": policy.fallback_after_s,
+            },
+            "message": msg,
+        }
+
+
+
+    # Optional: when running a dedicated worker on Railway, disable immediate draining
+    # in the API service to avoid races / duplicate AdSet numbering.
+    immediate = (os.getenv("ENABLE_IMMEDIATE_DRAIN", "true") or "true").strip().lower() not in {"0", "false", "no"}
+    if not immediate:
+        age_s = int((utcnow() - oldest_created_at).total_seconds())
+        msg = (
+            f"Queued (eligible to flush now; worker will drain). "
+            f"Policy: target {policy.target}, min {policy.minimum} after {policy.fallback_after_s}s. "
+            f"Unique={len(unique_video_ids)}, oldest_age_s={age_s}."
+        )
+        if duplicates:
+            msg += " Duplicates in queue: " + ", ".join(duplicates)
+
+        return {
+            "mode": "batch",
+            "queued": True,
+            "eligible_to_flush": True,
+            "queue_row_id": row_id,
+            "product": group_product,
+            "category": group_category,
+            "signature": group_signature,
+            "unique_videos_in_queue": len(unique_video_ids),
+            "duplicates_in_queue": duplicates,
+            "oldest_age_s": age_s,
+            "policy": {
+                "target": policy.target,
+                "minimum": policy.minimum,
+                "fallback_after_s": policy.fallback_after_s,
+            },
+            "message": msg,
+        }
+    # Resolve campaign IDs (DB first), then balance between the two campaigns for green/lila.
+    route_source = (os.getenv("CAMPAIGN_ROUTE_SOURCE") or "").strip().lower()
+    database_url = (os.getenv("DATABASE_URL") or "").strip() or None
+
+    required_slots = 2 if product in {"green", "lila"} else 1
+    variant_labels = resolve_campaign_variants_v2(product)
+
+    ids_by_slot: Dict[int, str] = {}
+    if route_source == "db" and database_url:
+        ensure_campaign_routes_table(database_url)
+        ids_by_slot = get_campaign_ids(database_url, product)
+
+    campaign_ids: List[str] = []
+    for slot in range(1, required_slots + 1):
+        cid = ids_by_slot.get(slot)
+        if cid and not dry_run:
+            obj = client.get_object(cid, fields="id,name,status,effective_status")
+            eff = (obj.get("effective_status") or obj.get("status") or "").strip().upper()
+            if eff in _BAD_EFFECTIVE_STATUSES:
+                if database_url:
+                    clear_campaign_id(database_url, product, slot=slot)
+                cid = None
+
+        if not cid:
+            variant_label = variant_labels[slot - 1] if slot - 1 < len(variant_labels) else variant_labels[0]
+            cname = build_campaign_name_v2(group_plan.product_label or "", group_plan.product_code or "", variant_label)
+            cid = client.find_campaign_id_by_name(cname)
+            if not cid:
+                camp_spec = group_plan.campaign.model_copy(deep=True)
+                camp_spec.name = cname
+                cid = client.create_campaign(camp_spec, dry_run=dry_run)
+            if route_source == "db" and database_url and cid and not dry_run:
+                upsert_campaign_id(database_url, product, slot, cid)
+
+        campaign_ids.append(cid)
+
+    chosen_campaign_id = campaign_ids[0]
+    if len(campaign_ids) > 1 and not dry_run:
+        counts = [(cid, client.count_adsets_in_campaign(cid)) for cid in campaign_ids]
+        counts.sort(key=lambda x: x[1])
+        chosen_campaign_id = counts[0][0]
+
+    # Determine next AdSet number (max across campaigns for this product)
+    next_adset_number = 1
+    if not dry_run:
+        max_n = 0
+        for cid in campaign_ids:
+            try:
+                n = client.get_max_adset_prefix_number(cid, prefix_re=_ADSET_PREFIX_RE_V2)
+                if n > max_n:
+                    max_n = n
+            except Exception:
+                pass
+        next_adset_number = max_n + 1
+
+    created_batches: List[dict] = []
+
+    safety = 0
+    while safety < 20:
+        safety += 1
+
+        remaining_rows = qstore.fetch_group(product=product, category=category, signature=signature, limit=500)
+        if not remaining_rows:
+            break
+
+        by_video = {}
+        for r in remaining_rows:
+            by_video.setdefault(r.video_id, []).append(r.id)
+        unique_video_ids = list(by_video.keys())
+
+        oldest_created_at = get_group_oldest_created_at(
+            qstore,
+            product=product,
+            category=category,
+            signature=signature,
+            rows=remaining_rows,
+        )
+        flush_size = decide_flush_size(len(unique_video_ids), oldest_created_at, policy)
+        if flush_size == 0:
+            break
+
+        # Select exactly `flush_size` unique videos (FIFO by id).
+        seen: set[str] = set()
+        selected: List[Any] = []
+        for r in remaining_rows:
+            if r.video_id in seen:
+                continue
+            selected.append(r)
+            seen.add(r.video_id)
+            if len(selected) >= flush_size:
+                break
+
+        if len(selected) < flush_size:
+            break
+
+        selected_ids = [int(r.id) for r in selected]
+        reserved_ids = selected_ids
+        if not dry_run and hasattr(qstore, "reserve_ids"):
+            try:
+                reserved_ids = list(qstore.reserve_ids(selected_ids))  # type: ignore[attr-defined]
+            except Exception:
+                reserved_ids = selected_ids
+
+            if len(reserved_ids) < flush_size:
+                if hasattr(qstore, "unreserve_ids") and reserved_ids:
+                    try:
+                        qstore.unreserve_ids(reserved_ids)  # type: ignore[attr-defined]
+                    except Exception:
+                        pass
+                continue
+
+        try:
+            adset_name = build_adset_name_v2(
+                next_adset_number,
+                group_plan.product_label or "",
+                group_plan.product_code or "",
+                group_plan.audience or "",
+            )
+            next_adset_number += 1
+
+            first_plan = LaunchPlan.model_validate(selected[0].payload)
+            adset_spec = first_plan.adset.model_copy(deep=True)
+            adset_spec.name = adset_name
+
+            if dry_run:
+                adset_id = "DRY_RUN_ADSET_ID"
+            else:
+                adset_id = client.create_adset(adset_spec, campaign_id=chosen_campaign_id, dry_run=False)
+
+            per_ad_results: List[dict] = []
+            processed_ids: List[int] = []
+            reserved_set = set(int(i) for i in reserved_ids)
+
+            for r in selected:
+                if not dry_run and hasattr(qstore, "reserve_ids") and int(r.id) not in reserved_set:
+                    continue
+
+                p = LaunchPlan.model_validate(r.payload)
+                p = ensure_image_hash_for_plan(client, cfg, p, dry_run=dry_run)
+
+                vid, var, _ = parse_video_name_v2(p.creative.name)
+                base_name = build_ad_base_name_v2(vid, var, p.product_label or "")
+                p.creative.name = base_name
+                p.creative.url_tags = merge_url_tags(p.creative.url_tags)
+                p.ad.name = build_ad_name_v2(base_name, p.offer_page or "")
+
+                launch_key_raw = f"{p.product}::{p.creative.name}::{p.ad.name}".encode("utf-8")
+                launch_key = "launch:" + hashlib.sha256(launch_key_raw).hexdigest()[:24]
+                plan_dict = p.model_dump()
+                payload_hash = sha256_json(plan_dict)
+
+                existing = store.get(launch_key)
+                if existing and (
+                    dry_run
+                    or (
+                        existing.get("ad_id")
+                        and is_meta_object_usable(client, str(existing.get("ad_id")))
+                    )
+                ):
+                    per_ad_results.append({"status": "skipped_existing", "launch_key": launch_key, **existing})
+                    processed_ids.append(int(r.id))
+                    continue
+
+                if dry_run:
+                    creative_id = "DRY_RUN_CREATIVE_ID"
+                    ad_id = "DRY_RUN_AD_ID"
+                else:
+                    creative_id = client.create_adcreative(p.creative, dry_run=False)
+                    ad_id = client.create_ad(p.ad, adset_id=adset_id, creative_id=creative_id, dry_run=False)
+
+                result = {
+                    "launch_key": launch_key,
+                    "payload_sha256": payload_hash,
+                    "campaign_id": chosen_campaign_id,
+                    "adset_id": adset_id,
+                    "creative_id": creative_id,
+                    "ad_id": ad_id,
+                }
+                if not dry_run:
+                    store.put(launch_key, payload_hash, result)
+
+                per_ad_results.append({"status": "created", **result})
+                processed_ids.append(int(r.id))
+
+            if processed_ids:
+                qstore.delete_ids(processed_ids)
+
+            created_batches.append(
+                {
+                    "campaign_id": chosen_campaign_id,
+                    "adset_id": adset_id,
+                    "adset_name": adset_name,
+                    "ads": per_ad_results,
+                }
+            )
+
+        except Exception:
+            if not dry_run and hasattr(qstore, "unreserve_ids") and reserved_ids:
+                try:
+                    qstore.unreserve_ids(reserved_ids)  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+            raise
+
+    msg = f"Launched {len(created_batches)} AdSet batch(es)."
+    if duplicates:
+        msg += " Note: versions of the same video cannot go in the same AdSet; duplicates in queue: " + ", ".join(duplicates)
+
+    return {
+        "mode": "batch",
+        "queued": False,
+        "product": product,
+        "category": category,
+        "signature": signature,
+        "duplicates_in_queue": duplicates,
+        "batches": created_batches,
+        "message": msg,
+    }
 def _run_launch_plan_v2(
     cfg: MetaConfig,
     plan: LaunchPlan,
@@ -1571,6 +2097,8 @@ def _run_launch_plan_v2(
         qstore.delete_ids(stale_ids)
         rows = [r for r in rows if r.id not in set(stale_ids)]
 
+    policy = get_batch_policy()
+
     # Compute uniqueness
     by_video: Dict[str, List[int]] = {}
     for r in rows:
@@ -1579,22 +2107,43 @@ def _run_launch_plan_v2(
     duplicates = sorted([vid for vid, ids in by_video.items() if len(ids) > 1])
     unique_video_ids = [vid for vid in by_video.keys()]
 
-    MIN_PER_ADSET = 3
-    MAX_PER_ADSET = 4
+    group_product = plan.product
+    group_category = plan.category or "ug"
+    group_signature = sig
 
-    if len(unique_video_ids) < MIN_PER_ADSET:
-        msg = f"Queued (need {MIN_PER_ADSET} unique videos, currently {len(unique_video_ids)})."
+    oldest_created_at = get_group_oldest_created_at(
+        qstore,
+        product=group_product,
+        category=group_category,
+        signature=group_signature,
+        rows=rows,
+    )
+    flush_size = decide_flush_size(len(unique_video_ids), oldest_created_at, policy)
+
+    if flush_size == 0:
+        age_s = int((utcnow() - oldest_created_at).total_seconds())
+        msg = (
+            f"Queued (aim {policy.target} unique; allow {policy.minimum} after {policy.fallback_after_s}s). "
+            f"Unique={len(unique_video_ids)}, oldest_age_s={age_s}."
+        )
         if duplicates:
-            msg += " Note: versions of the same video cannot go in the same AdSet; duplicates in queue: " + ", ".join(duplicates)
+            msg += " Duplicates in queue: " + ", ".join(duplicates)
+
         return {
             "mode": "batch",
             "queued": True,
             "queue_row_id": row_id,
-            "product": plan.product,
-            "category": plan.category,
-            "signature": sig,
+            "product": group_product,
+            "category": group_category,
+            "signature": group_signature,
             "unique_videos_in_queue": len(unique_video_ids),
             "duplicates_in_queue": duplicates,
+            "oldest_age_s": age_s,
+            "policy": {
+                "target": policy.target,
+                "minimum": policy.minimum,
+                "fallback_after_s": policy.fallback_after_s,
+            },
             "message": msg,
         }
 
@@ -1658,11 +2207,41 @@ def _run_launch_plan_v2(
     created_batches: List[dict] = []
     remaining_rows = rows
 
-    # Keep creating AdSets as long as we have >=3 unique videos left.
+    # Keep creating AdSets as long as this group is eligible under the batching policy.
+    # We *always* re-fetch from the store each iteration to handle:
+    #   - new items arriving while we're processing
+    #   - Postgres reservations (including stale reservations)
     safety = 0
     while safety < 20:
         safety += 1
-        # Recompute uniqueness each loop
+
+        remaining_rows = qstore.fetch_group(
+            product=group_product,
+            category=group_category,
+            signature=group_signature,
+            limit=500,
+        )
+        if not remaining_rows:
+            break
+
+        # Recompute uniqueness and gating for the remaining rows
+        by_video = {}
+        for r in remaining_rows:
+            by_video.setdefault(r.video_id, []).append(r.id)
+        unique_video_ids = list(by_video.keys())
+
+        oldest_created_at = get_group_oldest_created_at(
+            qstore,
+            product=group_product,
+            category=group_category,
+            signature=group_signature,
+            rows=remaining_rows,
+        )
+        flush_size = decide_flush_size(len(unique_video_ids), oldest_created_at, policy)
+        if flush_size == 0:
+            break
+
+        # Select exactly `flush_size` unique videos (FIFO by id).
         seen: set[str] = set()
         selected: List[Any] = []
         for r in remaining_rows:
@@ -1670,10 +2249,10 @@ def _run_launch_plan_v2(
                 continue
             selected.append(r)
             seen.add(r.video_id)
-            if len(selected) >= MAX_PER_ADSET:
+            if len(selected) >= flush_size:
                 break
 
-        if len(seen) < MIN_PER_ADSET:
+        if len(selected) < flush_size:
             break
 
         # Reserve selected rows so concurrent requests / replicas don't double-process.
@@ -1685,14 +2264,25 @@ def _run_launch_plan_v2(
             except Exception:
                 reserved_ids = selected_ids
 
-            # If we couldn't reserve enough rows (race), refresh and try again.
-            if len(reserved_ids) < MIN_PER_ADSET:
-                remaining_rows = qstore.fetch_group(product=plan.product, category=plan.category or "ug", signature=sig, limit=500)
+            # CRITICAL FIX:
+            # If we can't reserve ALL rows for this batch, release what we did reserve and retry.
+            # Partial reservation is what causes the confusing "one item always stuck" behavior.
+            if len(reserved_ids) < flush_size:
+                if hasattr(qstore, "unreserve_ids") and reserved_ids:
+                    try:
+                        qstore.unreserve_ids(reserved_ids)  # type: ignore[attr-defined]
+                    except Exception:
+                        pass
                 continue
 
         try:
             # Build AdSet name
-            adset_name = build_adset_name_v2(next_adset_number, plan.product_label or "", plan.product_code or "", plan.audience or "")
+            adset_name = build_adset_name_v2(
+                next_adset_number,
+                plan.product_label or "",
+                plan.product_code or "",
+                plan.audience or "",
+            )
             next_adset_number += 1
 
             # Use first payload for AdSet spec (all same signature)
@@ -1709,9 +2299,11 @@ def _run_launch_plan_v2(
             per_ad_results: List[dict] = []
             processed_ids: List[int] = []
 
+            reserved_set = set(int(i) for i in reserved_ids)
+
             for r in selected:
-                # Skip rows we failed to reserve in a race
-                if not dry_run and hasattr(qstore, "reserve_ids") and int(r.id) not in set(reserved_ids):
+                # Skip rows we failed to reserve in a race (shouldn't happen due to the guard above)
+                if not dry_run and hasattr(qstore, "reserve_ids") and int(r.id) not in reserved_set:
                     continue
 
                 p = LaunchPlan.model_validate(r.payload)
@@ -1731,9 +2323,15 @@ def _run_launch_plan_v2(
                 payload_hash = sha256_json(plan_dict)
 
                 existing = store.get(launch_key)
-                if existing and (dry_run or (existing.get("ad_id") and is_meta_object_usable(client, str(existing.get("ad_id"))))):
+                if existing and (
+                    dry_run
+                    or (
+                        existing.get("ad_id")
+                        and is_meta_object_usable(client, str(existing.get("ad_id")))
+                    )
+                ):
                     per_ad_results.append({"status": "skipped_existing", "launch_key": launch_key, **existing})
-                    processed_ids.append(r.id)
+                    processed_ids.append(int(r.id))
                     continue
 
                 # Create creative + ad
@@ -1757,7 +2355,7 @@ def _run_launch_plan_v2(
                     store.put(launch_key, payload_hash, result)
 
                 per_ad_results.append({"status": "created", **result})
-                processed_ids.append(r.id)
+                processed_ids.append(int(r.id))
 
             # Consume processed rows from the queue.
             # We also consume in dry-run so repeated tests don't accumulate old items.
@@ -1772,12 +2370,6 @@ def _run_launch_plan_v2(
                     "ads": per_ad_results,
                 }
             )
-
-            # Refresh remaining rows
-            if processed_ids:
-                remaining_rows = [r for r in remaining_rows if r.id not in set(processed_ids)]
-            else:
-                break
 
         except Exception:
             # If something failed mid-batch, unreserve so we don't deadlock the queue.
@@ -1796,7 +2388,7 @@ def _run_launch_plan_v2(
         "mode": "batch",
         "queued": False,
         "product": plan.product,
-        "category": plan.category,
+        "category": group_category,
         "signature": sig,
         "duplicates_in_queue": duplicates,
         "batches": created_batches,

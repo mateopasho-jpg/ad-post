@@ -78,6 +78,45 @@ Notes:
 - If you do not set `SERVICE_API_KEY`, you can omit the `X-API-Key` header.
 - For automation (Notion/Make), prefer `assets.image_url` over `assets.image_path`.
 
+
+## Worker (recommended for Railway)
+
+Schema v2 uses a **time-based fallback** (e.g. allow 3 items after 60s).
+If no new webhook arrives after the 3rd item, you still want the batch to flush — that’s what the worker does.
+
+Run the worker locally:
+
+```bash
+python worker.py
+```
+
+### Railway setup
+
+Create **two services** from the same repo:
+
+1) **API service** (web)
+- Start command: `uvicorn api:app --host 0.0.0.0 --port $PORT`
+
+2) **Worker service**
+- Start command: `python worker.py`
+
+Both services must share the same `DATABASE_URL` and should use Postgres stores.
+
+To avoid races, disable immediate draining in the API service when a worker is running:
+
+```bash
+ENABLE_IMMEDIATE_DRAIN=false
+```
+
+Then enable Postgres stores:
+
+
+```bash
+QUEUE_STORE_SOURCE=db
+IDEMPOTENCY_STORE_SOURCE=db
+```
+
+
 ---
 
 ## Schema v2 (current) — naming + batching
@@ -125,7 +164,9 @@ Variant labels default to:
 ### AdSet creation logic (3–4 ads, category separation)
 
 - Items are queued per `(product, category, adset_signature)`.
-- An AdSet is created **only when at least 3 unique video IDs** are available.
+- An AdSet is created when either:
+  - **4** unique video IDs are available (default target), OR
+  - **3** unique video IDs are available **and** the oldest item in the group has been queued for at least `BATCH_FALLBACK_AFTER_S` seconds (default **60s**).
 - Each AdSet contains **up to 4** unique video IDs.
 - Remaining items are automatically split into the next AdSet.
 - `category` must be `ai` or `ug`. AI and UG are **never mixed** in the same AdSet.

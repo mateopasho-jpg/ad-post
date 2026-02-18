@@ -1,6 +1,9 @@
+from __future__ import annotations
+
 import json
 import os
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence
 
 import psycopg
@@ -14,6 +17,7 @@ class QueueItem:
     signature: str
     video_id: str
     payload: Dict[str, Any]
+    created_at: datetime
 
 
 class StateStorePG:
@@ -26,6 +30,7 @@ class StateStorePG:
       - when selected for processing, they are marked state='reserved'
       - on success, rows are deleted
       - on failure, rows can be unreserved back to 'queued'
+
     """
 
     def __init__(
@@ -38,7 +43,9 @@ class StateStorePG:
         self.database_url = database_url
         self.table = table
         self.reserved_by = reserved_by or (
-            os.getenv("RAILWAY_SERVICE_NAME") or os.getenv("HOSTNAME") or "ad-post"
+            os.getenv("RAILWAY_SERVICE_NAME")
+            or os.getenv("HOSTNAME")
+            or "ad-post"
         )
         self._init()
 
@@ -65,7 +72,7 @@ class StateStorePG:
                     """
                 )
 
-                # Backward-compatible migrations (safe if columns already exist)
+                # Backward-compatible migrations
                 cur.execute(
                     f"ALTER TABLE {self.table} ADD COLUMN IF NOT EXISTS state TEXT NOT NULL DEFAULT 'queued'"
                 )
@@ -125,7 +132,7 @@ class StateStorePG:
             with conn.cursor() as cur:
                 cur.execute(
                     f"""
-                    SELECT id, product, category, signature, video_id, payload_json
+                    SELECT id, product, category, signature, video_id, payload_json, created_at
                     FROM {self.table}
                     WHERE product=%s AND category=%s AND signature=%s
                       AND (
@@ -140,11 +147,12 @@ class StateStorePG:
                 rows = cur.fetchall()
 
         out: List[QueueItem] = []
-        for (row_id, prod, cat, sig, vid, payload_json) in rows:
+        for (row_id, prod, cat, sig, vid, payload_json, created_at) in rows:
             try:
                 payload = payload_json if isinstance(payload_json, dict) else json.loads(payload_json)
             except Exception:
                 payload = {"_raw": payload_json}
+
             out.append(
                 QueueItem(
                     id=int(row_id),
@@ -153,6 +161,7 @@ class StateStorePG:
                     signature=str(sig),
                     video_id=str(vid),
                     payload=payload,
+                    created_at=created_at,
                 )
             )
         return out
@@ -226,3 +235,41 @@ class StateStorePG:
             with conn.cursor() as cur:
                 cur.execute(f"DELETE FROM {self.table}")
             conn.commit()
+
+    def list_groups(self, limit: int = 200) -> List[Dict[str, Any]]:
+        """Return groups with unique video count + oldest created_at.
+
+        Includes queued + stale-reserved (same eligibility as fetch_group).
+        """
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT product, category, signature,
+                        COUNT(DISTINCT video_id) AS unique_videos,
+                        MIN(created_at) AS oldest_created_at
+                    FROM {self.table}
+                    WHERE (
+                        state='queued'
+                        OR (state='reserved' AND reserved_at < (now() - interval '30 minutes'))
+                    )
+                    GROUP BY product, category, signature
+                    ORDER BY MIN(created_at) ASC
+                    LIMIT %s
+                    """,
+                    (int(limit),),
+                )
+                rows = cur.fetchall()
+
+        out: List[Dict[str, Any]] = []
+        for product, category, signature, unique_videos, oldest_created_at in rows:
+            out.append(
+                {
+                    "product": str(product),
+                    "category": str(category),
+                    "signature": str(signature),
+                    "unique_videos": int(unique_videos or 0),
+                    "oldest_created_at": oldest_created_at.isoformat() if oldest_created_at else None,
+                }
+            )
+        return out

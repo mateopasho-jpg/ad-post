@@ -1,8 +1,10 @@
+from __future__ import annotations
+
 import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Sequence
 
 
 @dataclass(frozen=True)
@@ -13,6 +15,7 @@ class QueueItem:
     signature: str
     video_id: str
     payload: Dict[str, Any]
+    created_at: datetime
 
 
 class StateStore:
@@ -25,10 +28,11 @@ class StateStore:
       - category (ai|ug)
       - signature: hash/key of the AdSet spec so we don't mix audiences/targeting
 
-    Batching rules (enforced by the caller):
-      - create AdSet only when >= 3 unique video_ids exist in a group
-      - max 4 unique video_ids per AdSet
-      - never place multiple variants of the same video_id in the same AdSet
+    Batching rules are enforced by the caller.
+
+    Note on concurrency:
+      - SQLite backend has *no* cross-process reservation.
+      - For Railway/production, prefer StateStorePG (Postgres) with QUEUE_STORE_SOURCE=db.
     """
 
     def __init__(self, db_path: str = ".queue_state.db"):
@@ -58,7 +62,15 @@ class StateStore:
             )
             conn.commit()
 
-    def enqueue(self, *, product: str, category: str, signature: str, video_id: str, payload: Dict[str, Any]) -> int:
+    def enqueue(
+        self,
+        *,
+        product: str,
+        category: str,
+        signature: str,
+        video_id: str,
+        payload: Dict[str, Any],
+    ) -> int:
         created_at = datetime.now(timezone.utc).isoformat()
         with sqlite3.connect(self.db_path) as conn:
             cur = conn.execute(
@@ -71,11 +83,18 @@ class StateStore:
             conn.commit()
             return int(cur.lastrowid)
 
-    def fetch_group(self, *, product: str, category: str, signature: str, limit: int = 200) -> List[QueueItem]:
+    def fetch_group(
+        self,
+        *,
+        product: str,
+        category: str,
+        signature: str,
+        limit: int = 200,
+    ) -> List[QueueItem]:
         with sqlite3.connect(self.db_path) as conn:
             cur = conn.execute(
                 """
-                SELECT id, product, category, signature, video_id, payload_json
+                SELECT id, product, category, signature, video_id, payload_json, created_at
                 FROM queue_v2
                 WHERE product=? AND category=? AND signature=?
                 ORDER BY id ASC
@@ -86,11 +105,22 @@ class StateStore:
             rows = cur.fetchall()
 
         out: List[QueueItem] = []
-        for (row_id, prod, cat, sig, vid, payload_json) in rows:
+        for (row_id, prod, cat, sig, vid, payload_json, created_at) in rows:
             try:
                 payload = json.loads(payload_json)
             except Exception:
                 payload = {"_raw": payload_json}
+
+            # created_at is stored as ISO string in SQLite.
+            try:
+                s = str(created_at).strip().replace("Z", "+00:00")
+                dt = datetime.fromisoformat(s)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                dt = dt.astimezone(timezone.utc)
+            except Exception:
+                dt = datetime.now(timezone.utc)
+
             out.append(
                 QueueItem(
                     id=int(row_id),
@@ -99,6 +129,7 @@ class StateStore:
                     signature=str(sig),
                     video_id=str(vid),
                     payload=payload,
+                    created_at=dt,
                 )
             )
         return out
@@ -113,7 +144,6 @@ class StateStore:
             conn.commit()
 
     # Reservation helpers (no-op for SQLite mode; used by Postgres backend).
-    # We keep these so the batching code can call them unconditionally.
     def reserve_ids(self, ids: Sequence[int]) -> List[int]:
         return [int(i) for i in ids]
 
@@ -133,3 +163,33 @@ class StateStore:
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("DELETE FROM queue_v2")
             conn.commit()
+
+    def list_groups(self, limit: int = 200) -> List[Dict[str, Any]]:
+        """Return groups with unique video count + oldest created_at."""
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute(
+                """
+                SELECT product, category, signature,
+                    COUNT(DISTINCT video_id) AS unique_videos,
+                    MIN(created_at) AS oldest_created_at
+                FROM queue_v2
+                GROUP BY product, category, signature
+                ORDER BY MIN(created_at) ASC
+                LIMIT ?
+                """,
+                (int(limit),),
+            )
+            rows = cur.fetchall()
+
+        out: List[Dict[str, Any]] = []
+        for product, category, signature, unique_videos, oldest_created_at in rows:
+            out.append(
+                {
+                    "product": str(product),
+                    "category": str(category),
+                    "signature": str(signature),
+                    "unique_videos": int(unique_videos or 0),
+                    "oldest_created_at": str(oldest_created_at),
+                }
+            )
+        return out
