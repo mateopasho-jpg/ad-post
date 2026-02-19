@@ -40,12 +40,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Literal
 import re
+from urllib.parse import urlparse, parse_qs
 from token_store import get_valid_access_token
 import io
 from PIL import Image
-import re
-from urllib.parse import urlparse, parse_qs
-
 
 import requests
 
@@ -191,7 +189,7 @@ def merge_url_tags(existing: Optional[str]) -> str:
 
 
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field, ValidationError, model_validator
+from pydantic import BaseModel, Field, ValidationError, model_validator, field_validator
 
 
 # -----------------------------
@@ -539,6 +537,35 @@ class AdSetSpec(BaseModel):
         return self
 
 
+class CreativeTextOptions(BaseModel):
+    """Optional text variants for a single creative (Flexible Creative).
+
+    If provided (or if lists are detected inside object_story_spec), the backend will
+    build AdCreative.asset_feed_spec so Meta can pick the best performing variants.
+    """
+
+    primary_texts: List[str] = Field(default_factory=list)
+    headlines: List[str] = Field(default_factory=list)
+    descriptions: List[str] = Field(default_factory=list)
+
+    @field_validator("primary_texts", "headlines", "descriptions", mode="before")
+    @classmethod
+    def _coerce_to_list(cls, v):
+        if v is None:
+            return []
+        if isinstance(v, str):
+            v = [v]
+        if isinstance(v, list):
+            out: List[str] = []
+            for x in v:
+                s = str(x).strip()
+                if s:
+                    out.append(s)
+            return out
+        # anything else: ignore
+        return []
+
+
 class CreativeSpec(BaseModel):
     name: str
     object_story_spec: Dict[str, Any]
@@ -546,6 +573,20 @@ class CreativeSpec(BaseModel):
     # In the API this is sent as AdCreative.url_tags
     url_tags: Optional[str] = None
     degrees_of_freedom_spec: Optional[Dict[str, Any]] = None
+
+    # Optional text variants (either sent explicitly or derived from object_story_spec lists)
+    text_options: Optional[CreativeTextOptions] = None
+
+    # Internal (built by backend when text_options / list fields exist)
+    asset_feed_spec: Optional[Dict[str, Any]] = None
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def _coerce_name(cls, v):
+        # Make.com sometimes sends single-item arrays
+        if isinstance(v, list) and len(v) == 1:
+            return str(v[0])
+        return v
 
 class AdSpec(BaseModel):
     name: str
@@ -1211,6 +1252,8 @@ class MetaClient:
             data["url_tags"] = spec.url_tags
         if spec.degrees_of_freedom_spec is not None:
             data["degrees_of_freedom_spec"] = json.dumps(spec.degrees_of_freedom_spec)
+        if spec.asset_feed_spec is not None:
+            data["asset_feed_spec"] = json.dumps(spec.asset_feed_spec)
 
         if dry_run:
             print("[DRY RUN] create_adcreative payload:", json.dumps(data, indent=2))
@@ -1218,6 +1261,17 @@ class MetaClient:
 
         payload = self._request("POST", f"/{acct}/adcreatives", data=data)
         return payload["id"]
+
+    def delete_object(self, object_id: str, *, dry_run: bool = False) -> dict:
+        """Best-effort DELETE of a Graph object (ad/adset/creative).
+
+        Not all objects support hard delete; if delete fails, callers should
+        attempt to PAUSE as a safety fallback.
+        """
+        if dry_run:
+            print("[DRY RUN] delete_object:", object_id)
+            return {"id": object_id, "deleted": True}
+        return self._request("DELETE", f"/{object_id}", data={})
 
     def create_ad(self, spec: AdSpec, adset_id: str, creative_id: str, *, dry_run: bool = False) -> str:
         acct = normalize_ad_account_id(self.cfg.ad_account_id)
@@ -1514,46 +1568,16 @@ def run_launch(
     return run_launch_plan(cfg, plan, store_path=store_path, dry_run=dry_run)
 
 
-_DRIVE_CONFIRM_RE = re.compile(r"confirm=([0-9A-Za-z_]+)")
-
-def _download_url_follow_drive_confirm(url: str, *, timeout_s: int = 30) -> requests.Response:
-    """
-    Download a URL and handle Google Drive 'Virus scan warning' interstitial pages
-    by extracting the confirm token and retrying.
-    """
-    s = requests.Session()
-
-    # First request
-    r = s.get(url, timeout=timeout_s, allow_redirects=True)
-    ct = (r.headers.get("Content-Type") or "").lower()
-    head = (r.content or b"")[:2000].lower()
-
-    # If Drive gives an interstitial HTML page, retry with confirm token
-    if "text/html" in ct and (b"virus scan warning" in head or b"google drive" in head):
-        m = _DRIVE_CONFIRM_RE.search(r.text or "")
-        if m:
-            token = m.group(1)
-            joiner = "&" if "?" in url else "?"
-            url2 = f"{url}{joiner}confirm={token}"
-            r2 = s.get(url2, timeout=timeout_s, allow_redirects=True)
-            return r2
-
-    return r
-
-
 def _fetch_and_normalize_image_bytes(url: str, *, timeout_s: int = 30) -> tuple[bytes, str]:
     """
     Downloads an image URL, normalizes it to a Meta-safe JPEG,
     and returns (jpeg_bytes, filename).
-
-    Includes Google Drive "virus scan warning" bypass.
     """
     url = (url or "").strip()
     if not url.lower().startswith(("http://", "https://")):
         raise ValueError("image_url must start with http:// or https://")
 
-    # Normalize Google Drive "file" links -> direct download
-    file_id = None
+    # Normalize Google Drive "view" links -> direct download
     if "drive.google.com/file/d/" in url:
         file_id = url.split("/file/d/")[1].split("/")[0]
         url = f"https://drive.google.com/uc?export=download&id={file_id}"
@@ -1568,44 +1592,55 @@ def _fetch_and_normalize_image_bytes(url: str, *, timeout_s: int = 30) -> tuple[
         "Accept-Language": "en-US,en;q=0.9",
     }
 
-    # Use a session so cookies persist (needed for Drive confirm flow)
-    s = requests.Session()
-    resp = s.get(url, headers=headers, timeout=timeout_s, allow_redirects=True)
+    # Use a session so cookies persist (needed for Drive confirm pages)
+    sess = requests.Session()
+    resp = sess.get(url, headers=headers, timeout=timeout_s, allow_redirects=True)
     resp.raise_for_status()
 
     ct = (resp.headers.get("Content-Type") or "").lower()
     raw = resp.content or b""
 
-    # If we got HTML, try Google Drive virus-warning confirm flow
+    # Guard: if it's tiny, it's almost certainly not an image (prevents Meta "file_size: 8")
+    if len(raw) < 1024:
+        raise ValueError(
+            f"Downloaded content too small to be an image ({len(raw)} bytes). "
+            f"content-type={ct} final_url={resp.url} preview={raw[:200]!r}"
+        )
+
+    # Guard: HTML means "not actually an image" (Notion/Drive permission pages)
+    # Special case: Google Drive sometimes returns a "Virus scan warning" HTML interstitial.
     head = raw[:2048].lstrip().lower()
     is_html = ("text/html" in ct) or head.startswith(b"<!doctype html") or head.startswith(b"<html")
     if is_html:
-        text = raw[:200_000].decode("utf-8", errors="ignore").lower()
+        text = raw[:250_000].decode("utf-8", errors="ignore")
+        lower = text.lower()
 
-        # Detect Drive virus scan warning page
-        if "google drive - virus scan warning" in text or "virus scan warning" in text:
-            # Attempt to extract confirm token from HTML
+        # Drive virus scan warning page -> extract confirm token and retry download.
+        if "virus scan warning" in lower and "google drive" in lower:
             m = re.search(r"confirm=([0-9a-zA-Z_]+)", text)
             if not m:
                 raise ValueError(
-                    f"Google Drive returned virus scan warning HTML and confirm token was not found. "
-                    f"final_url={resp.url}"
+                    f"URL returned Google Drive virus scan warning HTML but confirm token was not found. "
+                    f"content-type={ct} final_url={resp.url} preview={raw[:200]!r}"
                 )
             confirm = m.group(1)
 
-            # Try to recover the file id from the final URL if we didn't have it
-            if not file_id:
-                qs = parse_qs(urlparse(resp.url).query)
-                file_id = (qs.get("id") or [None])[0]
+            # Try to recover file id from the final URL (works for drive.usercontent.google.com/download?...id=...)
+            qs = parse_qs(urlparse(resp.url).query)
+            file_id = (qs.get("id") or [None])[0]
+            if not file_id and "drive.google.com/file/d/" in url:
+                try:
+                    file_id = url.split("/file/d/")[1].split("/")[0]
+                except Exception:
+                    file_id = None
 
             if not file_id:
                 raise ValueError(
                     f"Google Drive virus scan warning detected, but could not determine file id. final_url={resp.url}"
                 )
 
-            # Re-request with confirm token (this is what the UI does)
             retry_url = "https://drive.google.com/uc"
-            resp = s.get(
+            resp = sess.get(
                 retry_url,
                 params={"export": "download", "id": file_id, "confirm": confirm},
                 headers=headers,
@@ -1615,8 +1650,6 @@ def _fetch_and_normalize_image_bytes(url: str, *, timeout_s: int = 30) -> tuple[
             resp.raise_for_status()
             ct = (resp.headers.get("Content-Type") or "").lower()
             raw = resp.content or b""
-
-            # Re-check HTML after retry
             head = raw[:2048].lstrip().lower()
             is_html = ("text/html" in ct) or head.startswith(b"<!doctype html") or head.startswith(b"<html")
             if is_html:
@@ -1625,19 +1658,11 @@ def _fetch_and_normalize_image_bytes(url: str, *, timeout_s: int = 30) -> tuple[
                     f"content-type={ct} final_url={resp.url} preview={raw[:200]!r}"
                 )
         else:
-            # Any other HTML (permissions/login page/etc) should still error
             raise ValueError(
                 f"URL returned HTML, not an image. content-type={ct} final_url={resp.url} preview={raw[:200]!r}"
             )
 
-    # Guard: tiny content isn't an image
-    if len(raw) < 1024:
-        raise ValueError(
-            f"Downloaded content too small to be an image ({len(raw)} bytes). "
-            f"content-type={ct} final_url={resp.url} preview={raw[:200]!r}"
-        )
 
-    # Decode & normalize to JPEG
     try:
         img = Image.open(io.BytesIO(raw))
         img = img.convert("RGB")
@@ -1652,7 +1677,6 @@ def _fetch_and_normalize_image_bytes(url: str, *, timeout_s: int = 30) -> tuple[
         raise ValueError("JPEG re-encode failed; output too small")
 
     return jpeg_bytes, "image.jpg"
-
 
 
 
@@ -1729,18 +1753,27 @@ def inject_video_id(plan: 'LaunchPlan', video_id: str, *, thumbnail_url: Optiona
       - converts `link_data` (image-style spec) into valid `video_data`
     """
 
-    def _ensure_cta_link(vd: dict, link: str | None) -> dict:
-        if not link:
+    def _first_text(v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        if isinstance(v, list) and v:
+            v = v[0]
+        s = str(v).strip()
+        return s or None
+
+    def _ensure_cta_link(vd: dict, link: Any) -> dict:
+        link_s = _first_text(link)
+        if not link_s:
             return vd
         cta = vd.get('call_to_action')
         if not isinstance(cta, dict):
-            vd['call_to_action'] = {'type': 'LEARN_MORE', 'value': {'link': link}}
+            vd['call_to_action'] = {'type': 'LEARN_MORE', 'value': {'link': link_s}}
             return vd
         val = cta.get('value')
         if not isinstance(val, dict):
             val = {}
             cta['value'] = val
-        val.setdefault('link', link)
+        val.setdefault('link', link_s)
         vd['call_to_action'] = cta
         return vd
 
@@ -1777,12 +1810,15 @@ def inject_video_id(plan: 'LaunchPlan', video_id: str, *, thumbnail_url: Optiona
 
         # Map only fields that are valid for video_data.
         new_vd: dict[str, Any] = {'video_id': video_id}
-        if ld.get('message') is not None:
-            new_vd['message'] = ld.get('message')
-        if ld.get('name') is not None:
-            new_vd['title'] = ld.get('name')
-        if ld.get('description') is not None:
-            new_vd['link_description'] = ld.get('description')
+        msg = _first_text(ld.get('message'))
+        name = _first_text(ld.get('name'))
+        desc = _first_text(ld.get('description'))
+        if msg is not None:
+            new_vd['message'] = msg
+        if name is not None:
+            new_vd['title'] = name
+        if desc is not None:
+            new_vd['link_description'] = desc
 
         # Video thumbnail (Meta requires one): image_hash or image_url.
         thumb_hash = ld.get('image_hash')
@@ -1794,7 +1830,7 @@ def inject_video_id(plan: 'LaunchPlan', video_id: str, *, thumbnail_url: Optiona
         elif thumbnail_url:
             new_vd['image_url'] = str(thumbnail_url).strip()
 
-        link = ld.get('link')
+        link = _first_text(ld.get('link'))
         cta = ld.get('call_to_action')
         if isinstance(cta, dict):
             cta = dict(cta)
@@ -1917,6 +1953,193 @@ def ensure_media_for_plan(client: 'MetaClient', cfg: MetaConfig, plan: 'LaunchPl
 
         return plan
 
+    return plan
+
+
+def apply_flexible_text_variants(plan: 'LaunchPlan') -> 'LaunchPlan':
+    """Normalize list-valued text fields in object_story_spec and, if present,
+    build AdCreative.asset_feed_spec to enable multiple text options in a single creative.
+
+    Supports Make.com payloads where link_data fields are arrays (as in Ads Manager UI):
+      - link_data.message: [ ... ] -> bodies
+      - link_data.name: [ ... ] -> titles
+      - link_data.description: [ ... ] -> descriptions
+      - link_data.link: ["https://..."] -> first element used as destination
+
+    Also supports explicit creative.text_options (CreativeTextOptions).
+
+    This function is idempotent and safe to call multiple times.
+    """
+
+    oss = plan.creative.object_story_spec
+    if not isinstance(oss, dict):
+        return plan
+
+    # Merge options from explicit text_options and any list-valued fields in object_story_spec.
+    opts = plan.creative.text_options or CreativeTextOptions()
+
+    def _coerce_str_list(v: Any) -> List[str]:
+        if v is None:
+            return []
+        if isinstance(v, str):
+            s = v.strip()
+            return [s] if s else []
+        if isinstance(v, list):
+            out: List[str] = []
+            for x in v:
+                s = str(x).strip()
+                if s:
+                    out.append(s)
+            return out
+        return []
+
+    def _first_str(v: Any) -> Optional[str]:
+        arr = _coerce_str_list(v)
+        return arr[0] if arr else None
+
+    link_url: Optional[str] = None
+    cta_type: Optional[str] = None
+    image_hash: Optional[str] = None
+    video_id: Optional[str] = None
+    thumb_hash: Optional[str] = None
+    thumb_url: Optional[str] = None
+
+    # --- link_data (image/link creatives) ---
+    ld = oss.get("link_data")
+    if isinstance(ld, dict):
+        # URL: accept string or [string]
+        link_vals = _coerce_str_list(ld.get("link"))
+        if link_vals:
+            link_url = link_vals[0]
+            ld["link"] = link_url
+        elif isinstance(ld.get("link"), str):
+            link_url = (ld.get("link") or "").strip() or None
+
+        # Text variants: accept string or list
+        opts.primary_texts.extend([t for t in _coerce_str_list(ld.get("message")) if t])
+        opts.headlines.extend([t for t in _coerce_str_list(ld.get("name")) if t])
+        opts.descriptions.extend([t for t in _coerce_str_list(ld.get("description")) if t])
+
+        # Normalize the object_story_spec to a single default value (first option)
+        msg0 = _first_str(ld.get("message")) or (opts.primary_texts[0] if opts.primary_texts else None)
+        name0 = _first_str(ld.get("name")) or (opts.headlines[0] if opts.headlines else None)
+        desc0 = _first_str(ld.get("description")) or (opts.descriptions[0] if opts.descriptions else None)
+        if msg0:
+            ld["message"] = msg0
+        if name0:
+            ld["name"] = name0
+        if desc0:
+            ld["description"] = desc0
+
+        cta = ld.get("call_to_action")
+        if isinstance(cta, dict):
+            cta_type = (cta.get("type") or "").strip() or None
+            # Ensure CTA value.link exists (helps some accounts/placements)
+            if link_url:
+                val = cta.get("value")
+                if not isinstance(val, dict):
+                    val = {}
+                val.setdefault("link", link_url)
+                cta["value"] = val
+            ld["call_to_action"] = cta
+        else:
+            if link_url:
+                ld["call_to_action"] = {"type": "LEARN_MORE", "value": {"link": link_url}}
+                cta_type = "LEARN_MORE"
+
+        image_hash = (ld.get("image_hash") or "").strip() or None
+
+        oss["link_data"] = ld
+
+    # --- video_data (video creatives) ---
+    vd = oss.get("video_data")
+    if isinstance(vd, dict):
+        # Remove unsupported top-level link (Meta rejects it)
+        if "link" in vd:
+            vd.pop("link", None)
+
+        video_id = (vd.get("video_id") or "").strip() or None
+        thumb_hash = (vd.get("image_hash") or "").strip() or None
+        thumb_url = (vd.get("image_url") or "").strip() or None
+
+        opts.primary_texts.extend([t for t in _coerce_str_list(vd.get("message")) if t])
+        opts.headlines.extend([t for t in _coerce_str_list(vd.get("title")) if t])
+        opts.descriptions.extend([t for t in _coerce_str_list(vd.get("link_description")) if t])
+
+        msg0 = _first_str(vd.get("message")) or (opts.primary_texts[0] if opts.primary_texts else None)
+        title0 = _first_str(vd.get("title")) or (opts.headlines[0] if opts.headlines else None)
+        desc0 = _first_str(vd.get("link_description")) or (opts.descriptions[0] if opts.descriptions else None)
+        if msg0:
+            vd["message"] = msg0
+        if title0:
+            vd["title"] = title0
+        if desc0:
+            vd["link_description"] = desc0
+
+        cta = vd.get("call_to_action")
+        if isinstance(cta, dict):
+            cta_type = (cta.get("type") or "").strip() or cta_type
+            val = cta.get("value")
+            if isinstance(val, dict):
+                link_url = (val.get("link") or "").strip() or link_url
+        oss["video_data"] = vd
+
+    # De-dupe while preserving order (Meta doesn't need duplicates)
+    def _dedupe(seq: List[str]) -> List[str]:
+        seen = set()
+        out = []
+        for x in seq:
+            if x in seen:
+                continue
+            seen.add(x)
+            out.append(x)
+        return out
+
+    opts.primary_texts = _dedupe(opts.primary_texts)
+    opts.headlines = _dedupe(opts.headlines)
+    opts.descriptions = _dedupe(opts.descriptions)
+    plan.creative.text_options = opts
+
+    # Build asset_feed_spec only if we have 2+ variants in any text field.
+    wants_multi = (len(opts.primary_texts) > 1) or (len(opts.headlines) > 1) or (len(opts.descriptions) > 1)
+    if wants_multi:
+        if not link_url:
+            # Link URL required for flexible creatives.
+            # If not present, keep normalized single texts and skip asset feed.
+            plan.creative.object_story_spec = oss
+            return plan
+
+        afs: Dict[str, Any] = {
+            "link_urls": [{"website_url": link_url}],
+            "call_to_action_types": [cta_type or "LEARN_MORE"],
+        }
+        if opts.primary_texts:
+            afs["bodies"] = [{"text": t} for t in opts.primary_texts]
+        if opts.headlines:
+            afs["titles"] = [{"text": t} for t in opts.headlines]
+        if opts.descriptions:
+            afs["descriptions"] = [{"text": t} for t in opts.descriptions]
+
+        # Attach media for the feed so Meta can render variations.
+        if image_hash:
+            afs["images"] = [{"hash": image_hash}]
+        if video_id:
+            vobj: Dict[str, Any] = {"video_id": video_id}
+            if thumb_hash:
+                vobj["thumbnail_hash"] = thumb_hash
+            elif thumb_url:
+                vobj["thumbnail_url"] = thumb_url
+            afs["videos"] = [vobj]
+
+        plan.creative.asset_feed_spec = afs
+
+        # Opt-in to standard enhancements unless caller already set something.
+        if plan.creative.degrees_of_freedom_spec is None:
+            plan.creative.degrees_of_freedom_spec = {
+                "creative_features_spec": {"standard_enhancements": {"enroll_status": "OPT_IN"}}
+            }
+
+    plan.creative.object_story_spec = oss
     return plan
 
 
@@ -2063,7 +2286,8 @@ def _run_launch_plan_v1(
             adset_id = client.create_adset(adset_spec, campaign_id=campaign_id, dry_run=False)
             store.put_cached_adset_id(campaign_id, batch_id, bucket, adset_name, adset_id)
 
-    # 4) Create creative
+    # 4) Create creative (supports flexible text options)
+    plan = apply_flexible_text_variants(plan)
     creative_id = client.create_adcreative(plan.creative, dry_run=dry_run)
     # 5) Create ad
     ad_id = client.create_ad(plan.ad, adset_id=adset_id, creative_id=creative_id, dry_run=dry_run)
@@ -2244,40 +2468,6 @@ def _drain_queue_group_v2(
             },
             "message": msg,
         }
-
-
-
-    # Optional: when running a dedicated worker on Railway, disable immediate draining
-    # in the API service to avoid races / duplicate AdSet numbering.
-    immediate = (os.getenv("ENABLE_IMMEDIATE_DRAIN", "true") or "true").strip().lower() not in {"0", "false", "no"}
-    if not immediate:
-        age_s = int((utcnow() - oldest_created_at).total_seconds())
-        msg = (
-            f"Queued (eligible to flush now; worker will drain). "
-            f"Policy: target {policy.target}, min {policy.minimum} after {policy.fallback_after_s}s. "
-            f"Unique={len(unique_video_ids)}, oldest_age_s={age_s}."
-        )
-        if duplicates:
-            msg += " Duplicates in queue: " + ", ".join(duplicates)
-
-        return {
-            "mode": "batch",
-            "queued": True,
-            "eligible_to_flush": True,
-            "queue_row_id": row_id,
-            "product": group_product,
-            "category": group_category,
-            "signature": group_signature,
-            "unique_videos_in_queue": len(unique_video_ids),
-            "duplicates_in_queue": duplicates,
-            "oldest_age_s": age_s,
-            "policy": {
-                "target": policy.target,
-                "minimum": policy.minimum,
-                "fallback_after_s": policy.fallback_after_s,
-            },
-            "message": msg,
-        }
     # Resolve campaign IDs (DB first), then balance between the two campaigns for green/lila.
     route_source = (os.getenv("CAMPAIGN_ROUTE_SOURCE") or "").strip().lower()
     database_url = (os.getenv("DATABASE_URL") or "").strip() or None
@@ -2390,6 +2580,26 @@ def _drain_queue_group_v2(
                 continue
 
         try:
+            # -----------------------------------------------------------------
+            # IMPORTANT: avoid creating an AdSet unless we can create ALL ads for
+            # this batch. This prevents "1 ad inside an adset" partial batches.
+            # -----------------------------------------------------------------
+
+            rollback_on_failure = (os.getenv("ROLLBACK_ON_FAILURE", "true") or "true").strip().lower() not in {"0", "false", "no"}
+
+            def _safe_pause(obj_id: str):
+                try:
+                    client.set_status(obj_id, "PAUSED", dry_run=dry_run)
+                except Exception:
+                    pass
+
+            def _safe_delete(obj_id: str):
+                try:
+                    client.delete_object(obj_id, dry_run=dry_run)
+                except Exception:
+                    # Fallback to pausing if hard delete isn't supported
+                    _safe_pause(obj_id)
+
             adset_name = build_adset_name_v2(
                 next_adset_number,
                 group_plan.product_label or "",
@@ -2402,20 +2612,19 @@ def _drain_queue_group_v2(
             adset_spec = first_plan.adset.model_copy(deep=True)
             adset_spec.name = adset_name
 
-            if dry_run:
-                adset_id = "DRY_RUN_ADSET_ID"
-            else:
-                adset_id = client.create_adset(adset_spec, campaign_id=chosen_campaign_id, dry_run=False)
-
-            per_ad_results: List[dict] = []
-            processed_ids: List[int] = []
             reserved_set = set(int(i) for i in reserved_ids)
+
+            # Prepare items; drop idempotent hits BEFORE creating anything.
+            prepared: List[dict] = []
+            stale_queue_ids: List[int] = []
 
             for r in selected:
                 if not dry_run and hasattr(qstore, "reserve_ids") and int(r.id) not in reserved_set:
                     continue
 
                 p = LaunchPlan.model_validate(r.payload)
+                # Capture list-valued text variants before any video conversion happens.
+                p = apply_flexible_text_variants(p)
                 p = ensure_media_for_plan(client, cfg, p, dry_run=dry_run, stable_for_queue=False)
 
                 vid, var, _ = parse_video_name_v2(p.creative.name)
@@ -2424,10 +2633,12 @@ def _drain_queue_group_v2(
                 p.creative.url_tags = merge_url_tags(p.creative.url_tags)
                 p.ad.name = build_ad_name_v2(base_name, p.offer_page or "")
 
+                # Normalize list-valued text fields again (now we can attach media into asset_feed_spec)
+                p = apply_flexible_text_variants(p)
+
                 launch_key_raw = f"{p.product}::{p.creative.name}::{p.ad.name}".encode("utf-8")
                 launch_key = "launch:" + hashlib.sha256(launch_key_raw).hexdigest()[:24]
-                plan_dict = p.model_dump()
-                payload_hash = sha256_json(plan_dict)
+                payload_hash = sha256_json(p.model_dump())
 
                 existing = store.get(launch_key)
                 if existing and (
@@ -2437,31 +2648,75 @@ def _drain_queue_group_v2(
                         and is_meta_object_usable(client, str(existing.get("ad_id")))
                     )
                 ):
-                    per_ad_results.append({"status": "skipped_existing", "launch_key": launch_key, **existing})
-                    processed_ids.append(int(r.id))
+                    stale_queue_ids.append(int(r.id))
                     continue
 
+                prepared.append(
+                    {
+                        "queue_id": int(r.id),
+                        "plan": p,
+                        "launch_key": launch_key,
+                        "payload_hash": payload_hash,
+                    }
+                )
+
+            if stale_queue_ids:
+                qstore.delete_ids(stale_queue_ids)
+
+            # Enforce "all-or-nothing" for the adset batch
+            if len(prepared) < flush_size:
+                if not dry_run and hasattr(qstore, "unreserve_ids") and reserved_ids:
+                    try:
+                        qstore.unreserve_ids(reserved_ids)  # type: ignore[attr-defined]
+                    except Exception:
+                        pass
+                # Not enough fresh items to form a full batch right now
+                continue
+
+            # 1) Create all creatives first (no adset yet)
+            created_creatives: List[str] = []
+            for item in prepared:
                 if dry_run:
-                    creative_id = "DRY_RUN_CREATIVE_ID"
+                    cid = "DRY_RUN_CREATIVE_ID"
+                else:
+                    cid = client.create_adcreative(item["plan"].creative, dry_run=False)
+                item["creative_id"] = cid
+                created_creatives.append(cid)
+
+            # 2) Create the adset
+            if dry_run:
+                adset_id = "DRY_RUN_ADSET_ID"
+            else:
+                adset_id = client.create_adset(adset_spec, campaign_id=chosen_campaign_id, dry_run=False)
+
+            # 3) Create all ads referencing the creatives
+            created_ads: List[str] = []
+            per_ad_results: List[dict] = []
+            processed_ids: List[int] = []
+
+            for item in prepared:
+                p = item["plan"]
+                cid = item["creative_id"]
+                if dry_run:
                     ad_id = "DRY_RUN_AD_ID"
                 else:
-                    creative_id = client.create_adcreative(p.creative, dry_run=False)
-                    ad_id = client.create_ad(p.ad, adset_id=adset_id, creative_id=creative_id, dry_run=False)
+                    ad_id = client.create_ad(p.ad, adset_id=adset_id, creative_id=cid, dry_run=False)
+                created_ads.append(ad_id)
+                processed_ids.append(int(item["queue_id"]))
 
                 result = {
-                    "launch_key": launch_key,
-                    "payload_sha256": payload_hash,
+                    "launch_key": item["launch_key"],
+                    "payload_sha256": item["payload_hash"],
                     "campaign_id": chosen_campaign_id,
                     "adset_id": adset_id,
-                    "creative_id": creative_id,
+                    "creative_id": cid,
                     "ad_id": ad_id,
                 }
                 if not dry_run:
-                    store.put(launch_key, payload_hash, result)
-
+                    store.put(item["launch_key"], item["payload_hash"], result)
                 per_ad_results.append({"status": "created", **result})
-                processed_ids.append(int(r.id))
 
+            # Consume processed queue rows
             if processed_ids:
                 qstore.delete_ids(processed_ids)
 
@@ -2474,7 +2729,21 @@ def _drain_queue_group_v2(
                 }
             )
 
-        except Exception:
+        except Exception as e:
+            # Roll back best-effort (prevents half-filled adsets)
+            if rollback_on_failure:
+                try:
+                    # Try to delete ads/adset/creatives if we have them in locals
+                    local_vars = locals()
+                    for ad_id in local_vars.get("created_ads", []) or []:
+                        _safe_delete(str(ad_id))
+                    if "adset_id" in local_vars:
+                        _safe_delete(str(local_vars["adset_id"]))
+                    for cr_id in local_vars.get("created_creatives", []) or []:
+                        _safe_delete(str(cr_id))
+                except Exception:
+                    pass
+
             if not dry_run and hasattr(qstore, "unreserve_ids") and reserved_ids:
                 try:
                     qstore.unreserve_ids(reserved_ids)  # type: ignore[attr-defined]
@@ -2496,6 +2765,8 @@ def _drain_queue_group_v2(
         "batches": created_batches,
         "message": msg,
     }
+
+
 def _run_launch_plan_v2(
     cfg: MetaConfig,
     plan: LaunchPlan,
@@ -2623,253 +2894,48 @@ def _run_launch_plan_v2(
             "message": msg,
         }
 
-    # Resolve campaign IDs (DB first), then balance between the two campaigns for green/lila.
-    route_source = (os.getenv("CAMPAIGN_ROUTE_SOURCE") or "").strip().lower()
-    database_url = (os.getenv("DATABASE_URL") or "").strip() or None
-
-    required_slots = 2 if plan.product in {"green", "lila"} else 1
-    variant_labels = resolve_campaign_variants_v2(plan.product)
-
-    ids_by_slot: Dict[int, str] = {}
-    if route_source == "db" and database_url:
-        ensure_campaign_routes_table(database_url)
-        ids_by_slot = get_campaign_ids(database_url, plan.product)
-
-    campaign_ids: List[str] = []
-    for slot in range(1, required_slots + 1):
-        cid = ids_by_slot.get(slot)
-        if cid and not dry_run:
-            # Validate that stored IDs are still usable
-            obj = client.get_object(cid, fields="id,name,status,effective_status")
-            eff = (obj.get("effective_status") or obj.get("status") or "").strip().upper()
-            if eff in _BAD_EFFECTIVE_STATUSES:
-                if database_url:
-                    clear_campaign_id(database_url, plan.product, slot=slot)
-                cid = None
-
-        if not cid:
-            variant_label = variant_labels[slot - 1] if slot - 1 < len(variant_labels) else variant_labels[0]
-            cname = build_campaign_name_v2(plan.product_label or "", plan.product_code or "", variant_label)
-            cid = client.find_campaign_id_by_name(cname)
-            if not cid:
-                camp_spec = plan.campaign.model_copy(deep=True)
-                camp_spec.name = cname
-                cid = client.create_campaign(camp_spec, dry_run=dry_run)
-            if route_source == "db" and database_url and cid and not dry_run:
-                upsert_campaign_id(database_url, plan.product, slot, cid)
-
-        campaign_ids.append(cid)
-
-    # Balance for green/lila by picking the campaign with fewer AdSets
-    chosen_campaign_id = campaign_ids[0]
-    if len(campaign_ids) > 1 and not dry_run:
-        counts = [(cid, client.count_adsets_in_campaign(cid)) for cid in campaign_ids]
-        counts.sort(key=lambda x: x[1])
-        chosen_campaign_id = counts[0][0]
-
-    # Determine next AdSet number (max across campaigns for this product)
-    next_adset_number = 1
-    if not dry_run:
-        max_n = 0
-        for cid in campaign_ids:
-            try:
-                n = client.get_max_adset_prefix_number(cid, prefix_re=_ADSET_PREFIX_RE_V2)
-                if n > max_n:
-                    max_n = n
-            except Exception:
-                pass
-        next_adset_number = max_n + 1
-
-    created_batches: List[dict] = []
-    remaining_rows = rows
-
-    # Keep creating AdSets as long as this group is eligible under the batching policy.
-    # We *always* re-fetch from the store each iteration to handle:
-    #   - new items arriving while we're processing
-    #   - Postgres reservations (including stale reservations)
-    safety = 0
-    while safety < 20:
-        safety += 1
-
-        remaining_rows = qstore.fetch_group(
-            product=group_product,
-            category=group_category,
-            signature=group_signature,
-            limit=500,
+    # Optional: if you run a dedicated worker on Railway, disable immediate draining
+    # in the API service to avoid races / duplicate AdSet numbering.
+    immediate = (os.getenv("ENABLE_IMMEDIATE_DRAIN", "true") or "true").strip().lower() not in {"0", "false", "no"}
+    if not immediate:
+        age_s = int((utcnow() - oldest_created_at).total_seconds())
+        msg = (
+            f"Queued (eligible to flush now; worker will drain). "
+            f"Policy: target {policy.target}, min {policy.minimum} after {policy.fallback_after_s}s. "
+            f"Unique={len(unique_video_ids)}, oldest_age_s={age_s}."
         )
-        if not remaining_rows:
-            break
+        if duplicates:
+            msg += " Duplicates in queue: " + ", ".join(duplicates)
+        return {
+            "mode": "batch",
+            "queued": True,
+            "eligible_to_flush": True,
+            "queue_row_id": row_id,
+            "product": group_product,
+            "category": group_category,
+            "signature": group_signature,
+            "unique_videos_in_queue": len(unique_video_ids),
+            "duplicates_in_queue": duplicates,
+            "oldest_age_s": age_s,
+            "policy": {
+                "target": policy.target,
+                "minimum": policy.minimum,
+                "fallback_after_s": policy.fallback_after_s,
+            },
+            "message": msg,
+        }
 
-        # Recompute uniqueness and gating for the remaining rows
-        by_video = {}
-        for r in remaining_rows:
-            by_video.setdefault(r.video_id, []).append(r.id)
-        unique_video_ids = list(by_video.keys())
-
-        oldest_created_at = get_group_oldest_created_at(
-            qstore,
-            product=group_product,
-            category=group_category,
-            signature=group_signature,
-            rows=remaining_rows,
-        )
-        flush_size = decide_flush_size(len(unique_video_ids), oldest_created_at, policy)
-        if flush_size == 0:
-            break
-
-        # Select exactly `flush_size` unique videos (FIFO by id).
-        seen: set[str] = set()
-        selected: List[Any] = []
-        for r in remaining_rows:
-            if r.video_id in seen:
-                continue
-            selected.append(r)
-            seen.add(r.video_id)
-            if len(selected) >= flush_size:
-                break
-
-        if len(selected) < flush_size:
-            break
-
-        # Reserve selected rows so concurrent requests / replicas don't double-process.
-        selected_ids = [int(r.id) for r in selected]
-        reserved_ids = selected_ids
-        if not dry_run and hasattr(qstore, "reserve_ids"):
-            try:
-                reserved_ids = list(qstore.reserve_ids(selected_ids))  # type: ignore[attr-defined]
-            except Exception:
-                reserved_ids = selected_ids
-
-            # CRITICAL FIX:
-            # If we can't reserve ALL rows for this batch, release what we did reserve and retry.
-            # Partial reservation is what causes the confusing "one item always stuck" behavior.
-            if len(reserved_ids) < flush_size:
-                if hasattr(qstore, "unreserve_ids") and reserved_ids:
-                    try:
-                        qstore.unreserve_ids(reserved_ids)  # type: ignore[attr-defined]
-                    except Exception:
-                        pass
-                continue
-
-        try:
-            # Build AdSet name
-            adset_name = build_adset_name_v2(
-                next_adset_number,
-                plan.product_label or "",
-                plan.product_code or "",
-                plan.audience or "",
-            )
-            next_adset_number += 1
-
-            # Use first payload for AdSet spec (all same signature)
-            first_plan = LaunchPlan.model_validate(selected[0].payload)
-            adset_spec = first_plan.adset.model_copy(deep=True)
-            adset_spec.name = adset_name
-
-            if dry_run:
-                adset_id = "DRY_RUN_ADSET_ID"
-            else:
-                # NOTE: MetaClient.create_adset signature is (spec, campaign_id)
-                adset_id = client.create_adset(adset_spec, campaign_id=chosen_campaign_id, dry_run=False)
-
-            per_ad_results: List[dict] = []
-            processed_ids: List[int] = []
-
-            reserved_set = set(int(i) for i in reserved_ids)
-
-            for r in selected:
-                # Skip rows we failed to reserve in a race (shouldn't happen due to the guard above)
-                if not dry_run and hasattr(qstore, "reserve_ids") and int(r.id) not in reserved_set:
-                    continue
-
-                p = LaunchPlan.model_validate(r.payload)
-                p = ensure_media_for_plan(client, cfg, p, dry_run=dry_run, stable_for_queue=False)
-
-                # Final naming
-                vid, var, _ = parse_video_name_v2(p.creative.name)
-                base_name = build_ad_base_name_v2(vid, var, p.product_label or "")
-                p.creative.name = base_name
-                p.creative.url_tags = merge_url_tags(p.creative.url_tags)
-                p.ad.name = build_ad_name_v2(base_name, p.offer_page or "")
-
-                # Idempotency key
-                launch_key_raw = f"{p.product}::{p.creative.name}::{p.ad.name}".encode("utf-8")
-                launch_key = "launch:" + hashlib.sha256(launch_key_raw).hexdigest()[:24]
-                plan_dict = p.model_dump()
-                payload_hash = sha256_json(plan_dict)
-
-                existing = store.get(launch_key)
-                if existing and (
-                    dry_run
-                    or (
-                        existing.get("ad_id")
-                        and is_meta_object_usable(client, str(existing.get("ad_id")))
-                    )
-                ):
-                    per_ad_results.append({"status": "skipped_existing", "launch_key": launch_key, **existing})
-                    processed_ids.append(int(r.id))
-                    continue
-
-                # Create creative + ad
-                if dry_run:
-                    creative_id = "DRY_RUN_CREATIVE_ID"
-                    ad_id = "DRY_RUN_AD_ID"
-                else:
-                    creative_id = client.create_adcreative(p.creative, dry_run=False)
-                    # NOTE: MetaClient.create_ad signature is (spec, adset_id, creative_id)
-                    ad_id = client.create_ad(p.ad, adset_id=adset_id, creative_id=creative_id, dry_run=False)
-
-                result = {
-                    "launch_key": launch_key,
-                    "payload_sha256": payload_hash,
-                    "campaign_id": chosen_campaign_id,
-                    "adset_id": adset_id,
-                    "creative_id": creative_id,
-                    "ad_id": ad_id,
-                }
-                if not dry_run:
-                    store.put(launch_key, payload_hash, result)
-
-                per_ad_results.append({"status": "created", **result})
-                processed_ids.append(int(r.id))
-
-            # Consume processed rows from the queue.
-            # We also consume in dry-run so repeated tests don't accumulate old items.
-            if processed_ids:
-                qstore.delete_ids(processed_ids)
-
-            created_batches.append(
-                {
-                    "campaign_id": chosen_campaign_id,
-                    "adset_id": adset_id,
-                    "adset_name": adset_name,
-                    "ads": per_ad_results,
-                }
-            )
-
-        except Exception:
-            # If something failed mid-batch, unreserve so we don't deadlock the queue.
-            if not dry_run and hasattr(qstore, "unreserve_ids") and reserved_ids:
-                try:
-                    qstore.unreserve_ids(reserved_ids)  # type: ignore[attr-defined]
-                except Exception:
-                    pass
-            raise
-
-    msg = f"Launched {len(created_batches)} AdSet batch(es)."
-    if duplicates:
-        msg += " Note: versions of the same video cannot go in the same AdSet; duplicates in queue: " + ", ".join(duplicates)
-
-    return {
-        "mode": "batch",
-        "queued": False,
-        "product": plan.product,
-        "category": group_category,
-        "signature": sig,
-        "duplicates_in_queue": duplicates,
-        "batches": created_batches,
-        "message": msg,
-    }
+    drained = _drain_queue_group_v2(
+        cfg,
+        qstore=qstore,
+        store=store,
+        product=group_product,
+        category=group_category,
+        signature=group_signature,
+        dry_run=dry_run,
+    )
+    drained["queue_row_id"] = row_id
+    return drained
 
 
 
