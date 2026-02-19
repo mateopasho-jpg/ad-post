@@ -1265,6 +1265,23 @@ class MetaClient:
 
         return self._request("POST", f"/{adset_id}", data=data)
 
+    # -----------------------------
+    # Video helpers
+    # -----------------------------
+
+    def list_video_thumbnails(self, video_id: str, *, limit: int = 10) -> List[dict]:
+        """Return available thumbnails for a video (each item typically includes 'uri')."""
+        vid = (video_id or "").strip()
+        if not vid:
+            return []
+        payload = self._request(
+            "GET",
+            f"/{vid}/thumbnails",
+            params={"fields": "id,uri,is_preferred,width,height", "limit": str(limit)},
+        )
+        data = payload.get("data") or []
+        return data if isinstance(data, list) else []
+
 
 # -----------------------------
 # Utility
@@ -1296,6 +1313,44 @@ def inject_image_hash(plan: LaunchPlan, image_hash: str) -> LaunchPlan:
         if link_data.get("image_hash") in ("__FROM_UPLOAD__", "", None):
             link_data["image_hash"] = image_hash
     return plan
+
+
+def _pick_video_thumbnail_uri(thumbnails: List[dict]) -> Optional[str]:
+    """Pick the best thumbnail uri from Meta's thumbnail list."""
+    if not thumbnails:
+        return None
+    # Prefer the one marked is_preferred
+    for t in thumbnails:
+        if t.get("is_preferred") and (t.get("uri") or "").strip():
+            return str(t["uri"]).strip()
+    # Otherwise use first usable uri
+    for t in thumbnails:
+        uri = (t.get("uri") or "").strip()
+        if uri:
+            return uri
+    return None
+
+
+def wait_for_video_thumbnail_uri(
+    client: "MetaClient",
+    video_id: str,
+    *,
+    timeout_s: int = 60,
+    poll_s: int = 5,
+) -> Optional[str]:
+    """Poll Meta until a video thumbnail uri becomes available (or timeout)."""
+    deadline = time.time() + max(1, int(timeout_s))
+    while time.time() < deadline:
+        try:
+            thumbs = client.list_video_thumbnails(video_id, limit=10)
+            uri = _pick_video_thumbnail_uri(thumbs)
+            if uri:
+                return uri
+        except Exception:
+            # If Meta is still processing the video, thumbnails may temporarily fail.
+            pass
+        time.sleep(max(1, int(poll_s)))
+    return None
 
 
 # -----------------------------
@@ -1578,7 +1633,7 @@ def _detect_media_type(url: str, *, timeout_s: int = 20) -> str:
     return "image"
 
 
-def inject_video_id(plan: 'LaunchPlan', video_id: str) -> 'LaunchPlan':
+def inject_video_id(plan: 'LaunchPlan', video_id: str, *, thumbnail_url: Optional[str] = None) -> 'LaunchPlan':
     """Inject AdVideo id into creative.object_story_spec.
 
     ⚠️ Meta requires `object_story_spec.video_data` to NOT include a top-level `link` field.
@@ -1586,7 +1641,8 @@ def inject_video_id(plan: 'LaunchPlan', video_id: str) -> 'LaunchPlan':
 
     This helper:
       - injects `video_id`
-      - removes unsupported fields (`image_hash`, top-level `link`)
+      - removes unsupported fields (top-level `link`)
+      - ensures a thumbnail is present (`image_hash` or `image_url`) since Meta requires one
       - converts `link_data` (image-style spec) into valid `video_data`
     """
 
@@ -1616,11 +1672,14 @@ def inject_video_id(plan: 'LaunchPlan', video_id: str) -> 'LaunchPlan':
     if isinstance(vd, dict):
         vd = dict(vd)
         vd['video_id'] = video_id
-        vd.pop('image_hash', None)
+        # Keep image_hash / image_url if present: Meta uses them as the video thumbnail.
 
         # Some builders mistakenly include `link` at the top level -> convert to CTA
         link = vd.pop('link', None)
         vd = _ensure_cta_link(vd, link)
+        # Meta requires a thumbnail for video creatives: one of image_hash or image_url.
+        if thumbnail_url and not (vd.get('image_hash') or vd.get('image_url')):
+            vd['image_url'] = str(thumbnail_url).strip()
 
         oss.pop('link_data', None)
         oss['video_data'] = vd
@@ -1630,7 +1689,8 @@ def inject_video_id(plan: 'LaunchPlan', video_id: str) -> 'LaunchPlan':
     ld = oss.get('link_data')
     if isinstance(ld, dict):
         ld = dict(ld)
-        ld.pop('image_hash', None)
+
+        # Keep image_hash / image_url if present: Meta uses them as the video thumbnail.
 
         # Map only fields that are valid for video_data.
         new_vd: dict[str, Any] = {'video_id': video_id}
@@ -1640,6 +1700,16 @@ def inject_video_id(plan: 'LaunchPlan', video_id: str) -> 'LaunchPlan':
             new_vd['title'] = ld.get('name')
         if ld.get('description') is not None:
             new_vd['link_description'] = ld.get('description')
+
+        # Video thumbnail (Meta requires one): image_hash or image_url.
+        thumb_hash = ld.get('image_hash')
+        thumb_url = ld.get('image_url') or ld.get('picture')
+        if thumb_hash:
+            new_vd['image_hash'] = thumb_hash
+        elif thumb_url:
+            new_vd['image_url'] = thumb_url
+        elif thumbnail_url:
+            new_vd['image_url'] = str(thumbnail_url).strip()
 
         link = ld.get('link')
         cta = ld.get('call_to_action')
@@ -1675,7 +1745,26 @@ def ensure_media_for_plan(client: 'MetaClient', cfg: MetaConfig, plan: 'LaunchPl
         inject_image_hash(plan, a.image_hash)
         return plan
     if getattr(a, "video_id", None):
-        inject_video_id(plan, a.video_id)
+        # Meta requires a thumbnail for video creatives (image_hash or image_url in video_data).
+        # If one is not already present in the payload, we try to fetch Meta-generated thumbnails
+        # for this uploaded video and inject the first usable uri.
+        thumb_url = None
+        if not dry_run:
+            oss = plan.creative.object_story_spec
+            thumb_present = False
+            if isinstance(oss, dict):
+                vd = oss.get('video_data')
+                if isinstance(vd, dict) and (vd.get('image_hash') or vd.get('image_url')):
+                    thumb_present = True
+                ld = oss.get('link_data')
+                if isinstance(ld, dict) and (ld.get('image_hash') or ld.get('image_url') or ld.get('picture')):
+                    thumb_present = True
+            if not thumb_present:
+                t_timeout = int((os.getenv('VIDEO_THUMBNAIL_TIMEOUT_S', '60') or '60').strip() or '60')
+                t_poll = int((os.getenv('VIDEO_THUMBNAIL_POLL_S', '5') or '5').strip() or '5')
+                thumb_url = wait_for_video_thumbnail_uri(client, a.video_id, timeout_s=t_timeout, poll_s=t_poll)
+
+        inject_video_id(plan, a.video_id, thumbnail_url=thumb_url)
         return plan
 
     media_url = (a.media_url or a.image_url or a.video_url or "").strip() or None
@@ -1736,7 +1825,12 @@ def ensure_media_for_plan(client: 'MetaClient', cfg: MetaConfig, plan: 'LaunchPl
             a.video_path = None
             a.image_url = None
             a.image_path = None
-            inject_video_id(plan, video_id)
+            thumb_url = None
+            if not dry_run:
+                t_timeout = int((os.getenv('VIDEO_THUMBNAIL_TIMEOUT_S', '60') or '60').strip() or '60')
+                t_poll = int((os.getenv('VIDEO_THUMBNAIL_POLL_S', '5') or '5').strip() or '5')
+                thumb_url = wait_for_video_thumbnail_uri(client, video_id, timeout_s=t_timeout, poll_s=t_poll)
+            inject_video_id(plan, video_id, thumbnail_url=thumb_url)
 
         return plan
 
