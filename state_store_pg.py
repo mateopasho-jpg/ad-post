@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 from dataclasses import dataclass
 from datetime import datetime
@@ -63,6 +64,7 @@ class StateStorePG:
                       category TEXT NOT NULL,
                       signature TEXT NOT NULL,
                       video_id TEXT NOT NULL,
+                      ingest_key TEXT,
                       payload_json JSONB NOT NULL,
                       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                       state TEXT NOT NULL DEFAULT 'queued',
@@ -83,6 +85,18 @@ class StateStorePG:
                     f"ALTER TABLE {self.table} ADD COLUMN IF NOT EXISTS reserved_by TEXT"
                 )
 
+                # Idempotency: prevents duplicate rows when upstream retries after a 5xx.
+                cur.execute(
+                    f"ALTER TABLE {self.table} ADD COLUMN IF NOT EXISTS ingest_key TEXT"
+                )
+
+                conname = f"uq_{self.table}_ingest_key"
+                cur.execute("SELECT 1 FROM pg_constraint WHERE conname = %s", (conname,))
+                if cur.fetchone() is None:
+                    cur.execute(
+                        f"ALTER TABLE {self.table} ADD CONSTRAINT {conname} UNIQUE (ingest_key)"
+                    )
+
                 cur.execute(
                     f"""
                     CREATE INDEX IF NOT EXISTS idx_{self.table}_group
@@ -100,15 +114,21 @@ class StateStorePG:
         video_id: str,
         payload: Dict[str, Any],
     ) -> int:
+        payload_str = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        ingest_key = hashlib.sha256(
+            f"{product}|{category}|{signature}|{video_id}|{payload_str}".encode("utf-8")
+        ).hexdigest()
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     f"""
-                    INSERT INTO {self.table} (product, category, signature, video_id, payload_json)
-                    VALUES (%s, %s, %s, %s, %s)
+                    INSERT INTO {self.table} (product, category, signature, video_id, ingest_key, payload_json)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (ingest_key)
+                    DO UPDATE SET ingest_key = EXCLUDED.ingest_key
                     RETURNING id
                     """,
-                    (product, category, signature, video_id, json.dumps(payload, ensure_ascii=False)),
+                    (product, category, signature, video_id, ingest_key, json.dumps(payload, ensure_ascii=False)),
                 )
                 row = cur.fetchone()
             conn.commit()

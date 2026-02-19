@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -49,10 +50,19 @@ class StateStore:
                     category TEXT NOT NULL,
                     signature TEXT NOT NULL,
                     video_id TEXT NOT NULL,
+                    ingest_key TEXT,
                     payload_json TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 )
                 """
+            )
+            # SQLite doesn't support ADD COLUMN IF NOT EXISTS, so we try and ignore duplicates.
+            try:
+                conn.execute("ALTER TABLE queue_v2 ADD COLUMN ingest_key TEXT")
+            except sqlite3.OperationalError:
+                pass
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_queue_v2_ingest_key ON queue_v2(ingest_key)"
             )
             conn.execute(
                 """
@@ -72,16 +82,22 @@ class StateStore:
         payload: Dict[str, Any],
     ) -> int:
         created_at = datetime.now(timezone.utc).isoformat()
+        payload_str = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        ingest_key = hashlib.sha256(
+            f"{product}|{category}|{signature}|{video_id}|{payload_str}".encode("utf-8")
+        ).hexdigest()
         with sqlite3.connect(self.db_path) as conn:
-            cur = conn.execute(
+            conn.execute(
                 """
-                INSERT INTO queue_v2 (product, category, signature, video_id, payload_json, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT OR IGNORE INTO queue_v2 (product, category, signature, video_id, ingest_key, payload_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (product, category, signature, video_id, json.dumps(payload, ensure_ascii=False), created_at),
+                (product, category, signature, video_id, ingest_key, json.dumps(payload, ensure_ascii=False), created_at),
             )
+            cur = conn.execute("SELECT id FROM queue_v2 WHERE ingest_key=?", (ingest_key,))
+            row = cur.fetchone()
             conn.commit()
-            return int(cur.lastrowid)
+            return int(row[0])
 
     def fetch_group(
         self,

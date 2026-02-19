@@ -631,30 +631,44 @@ class LaunchPlan(BaseModel):
     ad: AdSpec
     assets: Optional[AssetsSpec] = None
 
-@model_validator(mode="after")
-def _check_assets(self) -> "LaunchPlan":
-    # Assets are optional. If provided, require at least one valid input.
-    if self.assets:
-        a = self.assets
-        has_any = any([
-            bool(a.image_hash),
-            bool(a.video_id),
-            bool(a.image_path),
-            bool(a.video_path),
-            bool(a.media_url),
-            bool(a.image_url),
-            bool(a.video_url),
-        ])
-        if not has_any:
-            raise ValueError(
-                "assets must include at least one of: image_hash, video_id, image_path, video_path, media_url, image_url, video_url"
-            )
+    @model_validator(mode="after")
+    def _check_assets(self) -> "LaunchPlan":
+        # Assets are optional. If provided, require at least one valid input.
+        if self.assets:
+            a = self.assets
 
-        # Safety: don't allow both image_hash and video_id.
-        if a.image_hash and a.video_id:
-            raise ValueError("assets cannot include both image_hash and video_id. Choose one media type.")
+            # Back-compat: if old fields are used, map into media_url for detection.
+            if not (a.media_url or "").strip():
+                if (a.image_url or "").strip():
+                    a.media_url = a.image_url
+                elif (a.video_url or "").strip():
+                    a.media_url = a.video_url
 
-    return self
+            has_any = any([
+                bool((a.image_hash or "").strip()),
+                bool((a.video_id or "").strip()),
+                bool((a.image_path or "").strip()),
+                bool((a.video_path or "").strip()),
+                bool((a.media_url or "").strip()),
+                bool((a.image_url or "").strip()),
+                bool((a.video_url or "").strip()),
+            ])
+            if not has_any:
+                raise ValueError(
+                    "assets must include at least one of: image_hash, video_id, image_path, video_path, media_url, image_url, video_url"
+                )
+
+            # Safety: don't allow both image_hash and video_id.
+            if (a.image_hash or "").strip() and (a.video_id or "").strip():
+                raise ValueError("assets cannot include both image_hash and video_id. Choose one media type.")
+
+            # If caller explicitly sets media_type, normalize it.
+            if a.media_type:
+                a.media_type = str(a.media_type).strip().lower()  # type: ignore[assignment]
+                if a.media_type not in {"image", "video"}:
+                    raise ValueError("assets.media_type must be 'image' or 'video'")
+
+        return self
 
     @model_validator(mode="after")
     def _check_product(self) -> "LaunchPlan":
@@ -734,8 +748,7 @@ def _check_assets(self) -> "LaunchPlan":
                 "You must provide a budget either at campaign level (daily_budget/lifetime_budget) or adset level."
             )
 
-        # ✅ If we're using ABO (adset budget), ensure the campaign flag is explicitly set.
-        # Meta error_subcode 4834011 suggests some accounts require this now.
+        # If we're using ABO (adset budget), ensure the campaign flag is explicitly set.
         if using_adset_budget and self.campaign.is_adset_budget_sharing_enabled is None:
             self.campaign.is_adset_budget_sharing_enabled = False
 
@@ -1004,91 +1017,91 @@ class MetaClient:
 
 
 
-def upload_video(
-    self,
-    *,
-    video_path: str | None = None,
-    video_bytes: bytes | None = None,
-    filename: str = "video.mp4",
-    file_url: str | None = None,
-    name: str | None = None,
-    ad_account_id: str | None = None,
-    wait_for_ready: bool = True,
-    wait_timeout_s: int = 600,
-    wait_poll_s: int = 5,
-) -> str:
-    """Upload a video and return the AdVideo id.
+    def upload_video(
+        self,
+        *,
+        video_path: str | None = None,
+        video_bytes: bytes | None = None,
+        filename: str = "video.mp4",
+        file_url: str | None = None,
+        name: str | None = None,
+        ad_account_id: str | None = None,
+        wait_for_ready: bool = True,
+        wait_timeout_s: int = 600,
+        wait_poll_s: int = 5,
+    ) -> str:
+        """Upload a video and return the AdVideo id.
 
-    Supported inputs:
-      - file_url: remote URL to a video file (preferred for Make/Notion)
-      - video_path / video_bytes: local upload (dev/testing)
+        Supported inputs:
+          - file_url: remote URL to a video file (preferred for Make/Notion)
+          - video_path / video_bytes: local upload (dev/testing)
 
-    Notes:
-      - Uses graph-video domain for upload.
-      - Optionally waits until encoding is ready.
-    """
-    acct = normalize_ad_account_id(ad_account_id or self.cfg.ad_account_id)
+        Notes:
+          - Uses graph-video domain for upload.
+          - Optionally waits until encoding is ready.
+        """
+        acct = normalize_ad_account_id(ad_account_id or self.cfg.ad_account_id)
 
-    if file_url:
-        data: Dict[str, Any] = {"file_url": file_url}
-        if name:
-            data["name"] = name
-        payload = self._request("POST", f"/{acct}/advideos", data=data, use_video=True)
-        video_id = str(payload.get("id") or "").strip()
-        if not video_id:
-            raise MetaAPIError(f"Video upload did not return id. Response: {payload}")
-    else:
-        if video_bytes is None:
-            if not video_path:
-                raise ValueError("Provide file_url, video_path, or video_bytes.")
-            p = Path(video_path)
-            if not p.exists():
-                raise FileNotFoundError(f"Video file not found: {p}")
-            video_bytes = p.read_bytes()
-            filename = p.name or filename
+        if file_url:
+            data: Dict[str, Any] = {"file_url": file_url}
+            if name:
+                data["name"] = name
+            payload = self._request("POST", f"/{acct}/advideos", data=data, use_video=True)
+            video_id = str(payload.get("id") or "").strip()
+            if not video_id:
+                raise MetaAPIError(f"Video upload did not return id. Response: {payload}")
+        else:
+            if video_bytes is None:
+                if not video_path:
+                    raise ValueError("Provide file_url, video_path, or video_bytes.")
+                p = Path(video_path)
+                if not p.exists():
+                    raise FileNotFoundError(f"Video file not found: {p}")
+                video_bytes = p.read_bytes()
+                filename = p.name or filename
 
-        # Multipart upload; Meta expects 'source'
-        files = {"source": (filename, video_bytes, "video/mp4")}
-        data: Dict[str, Any] = {}
-        if name:
-            data["name"] = name
-        payload = self._request("POST", f"/{acct}/advideos", files=files, data=data, use_video=True)
-        video_id = str(payload.get("id") or "").strip()
-        if not video_id:
-            raise MetaAPIError(f"Video upload did not return id. Response: {payload}")
+            # Multipart upload; Meta expects 'source'
+            files = {"source": (filename, video_bytes, "video/mp4")}
+            data: Dict[str, Any] = {}
+            if name:
+                data["name"] = name
+            payload = self._request("POST", f"/{acct}/advideos", files=files, data=data, use_video=True)
+            video_id = str(payload.get("id") or "").strip()
+            if not video_id:
+                raise MetaAPIError(f"Video upload did not return id. Response: {payload}")
 
-    if wait_for_ready:
-        self.wait_for_video_ready(video_id, timeout_s=wait_timeout_s, poll_s=wait_poll_s)
+        if wait_for_ready:
+            self.wait_for_video_ready(video_id, timeout_s=wait_timeout_s, poll_s=wait_poll_s)
 
-    return video_id
+        return video_id
 
 
-def wait_for_video_ready(self, video_id: str, *, timeout_s: int = 600, poll_s: int = 5) -> None:
-    """Poll AdVideo status until it's ready (or timeout)."""
-    deadline = time.time() + max(10, int(timeout_s))
-    last_status = None
+    def wait_for_video_ready(self, video_id: str, *, timeout_s: int = 600, poll_s: int = 5) -> None:
+        """Poll AdVideo status until it's ready (or timeout)."""
+        deadline = time.time() + max(10, int(timeout_s))
+        last_status = None
 
-    while time.time() < deadline:
-        obj = self.get_object(str(video_id), fields="status")
-        status = obj.get("status")
+        while time.time() < deadline:
+            obj = self.get_object(str(video_id), fields="status")
+            status = obj.get("status")
 
-        # status is usually a dict: {"video_status":"processing"|"ready", ...}
-        video_status = None
-        if isinstance(status, dict):
-            video_status = (status.get("video_status") or status.get("status") or "").strip().lower() or None
-            last_status = status
-        elif isinstance(status, str):
-            video_status = status.strip().lower() or None
-            last_status = status
+            # status is usually a dict: {"video_status":"processing"|"ready", ...}
+            video_status = None
+            if isinstance(status, dict):
+                video_status = (status.get("video_status") or status.get("status") or "").strip().lower() or None
+                last_status = status
+            elif isinstance(status, str):
+                video_status = status.strip().lower() or None
+                last_status = status
 
-        if video_status in {"ready", "complete", "completed"}:
-            return
-        if video_status in {"error", "failed"}:
-            raise MetaAPIError(f"Video encoding failed for {video_id}. status={status}")
+            if video_status in {"ready", "complete", "completed"}:
+                return
+            if video_status in {"error", "failed"}:
+                raise MetaAPIError(f"Video encoding failed for {video_id}. status={status}")
 
-        time.sleep(max(1, int(poll_s)))
+            time.sleep(max(1, int(poll_s)))
 
-    raise MetaAPIError(f"Timed out waiting for video {video_id} to become ready. last_status={last_status}")
+        raise MetaAPIError(f"Timed out waiting for video {video_id} to become ready. last_status={last_status}")
 
     def create_campaign(self, spec: CampaignSpec, *, dry_run: bool = False) -> str:
         acct = normalize_ad_account_id(self.cfg.ad_account_id)
