@@ -43,6 +43,7 @@ import re
 from token_store import get_valid_access_token
 import io
 from PIL import Image
+import re
 
 import requests
 
@@ -1511,6 +1512,33 @@ def run_launch(
     return run_launch_plan(cfg, plan, store_path=store_path, dry_run=dry_run)
 
 
+_DRIVE_CONFIRM_RE = re.compile(r"confirm=([0-9A-Za-z_]+)")
+
+def _download_url_follow_drive_confirm(url: str, *, timeout_s: int = 30) -> requests.Response:
+    """
+    Download a URL and handle Google Drive 'Virus scan warning' interstitial pages
+    by extracting the confirm token and retrying.
+    """
+    s = requests.Session()
+
+    # First request
+    r = s.get(url, timeout=timeout_s, allow_redirects=True)
+    ct = (r.headers.get("Content-Type") or "").lower()
+    head = (r.content or b"")[:2000].lower()
+
+    # If Drive gives an interstitial HTML page, retry with confirm token
+    if "text/html" in ct and (b"virus scan warning" in head or b"google drive" in head):
+        m = _DRIVE_CONFIRM_RE.search(r.text or "")
+        if m:
+            token = m.group(1)
+            joiner = "&" if "?" in url else "?"
+            url2 = f"{url}{joiner}confirm={token}"
+            r2 = s.get(url2, timeout=timeout_s, allow_redirects=True)
+            return r2
+
+    return r
+
+
 def _fetch_and_normalize_image_bytes(url: str, *, timeout_s: int = 30) -> tuple[bytes, str]:
     """
     Downloads an image URL, normalizes it to a Meta-safe JPEG,
@@ -1535,7 +1563,7 @@ def _fetch_and_normalize_image_bytes(url: str, *, timeout_s: int = 30) -> tuple[
         "Accept-Language": "en-US,en;q=0.9",
     }
 
-    resp = requests.get(url, headers=headers, timeout=timeout_s, allow_redirects=True)
+    resp = _download_url_follow_drive_confirm(url, timeout_s=timeout_s)
     resp.raise_for_status()
 
     ct = (resp.headers.get("Content-Type") or "").lower()
