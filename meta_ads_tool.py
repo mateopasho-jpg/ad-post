@@ -548,10 +548,39 @@ class AdSpec(BaseModel):
     name: str
     status: str = "PAUSED"
 
+
 class AssetsSpec(BaseModel):
+    """Asset inputs.
+
+    Backward compatible:
+      - image_url / image_path / image_hash
+
+    New (recommended):
+      - media_url: single URL that can be image OR video; backend auto-detects.
+      - media_type: optional override ('image' | 'video'). If omitted, backend detects.
+
+    Video support:
+      - video_url / video_path / video_id
+
+    Notes:
+      - For schema v2 batching, images are uploaded before enqueue (stable payload).
+      - Videos are uploaded during the drain/post step (can take longer).
+    """
+
+    # Single URL (image OR video) - preferred
+    media_url: Optional[str] = None
+    media_type: Optional[Literal["image", "video"]] = None
+
+    # Backward compatible image fields
     image_path: Optional[str] = None  # local file path
     image_hash: Optional[str] = None  # if you already have it
-    image_url: Optional[str] = None   # http(s) URL to an image (backend will download then upload)
+    image_url: Optional[str] = None   # http(s) URL to an image
+
+    # Video fields
+    video_path: Optional[str] = None  # local file path (mp4/mov)
+    video_url: Optional[str] = None   # http(s) URL to a video
+    video_id: Optional[str] = None    # if you already uploaded to Meta (AdVideo id)
+
 
 class LaunchPlan(BaseModel):
     schema_version: int = 1
@@ -602,12 +631,30 @@ class LaunchPlan(BaseModel):
     ad: AdSpec
     assets: Optional[AssetsSpec] = None
 
-    @model_validator(mode="after")
-    def _check_assets(self) -> "LaunchPlan":
-        if self.assets:
-            if not self.assets.image_hash and not self.assets.image_path and not self.assets.image_url:
-                raise ValueError("assets must include image_hash, image_path, or image_url (for upload).")
-        return self
+@model_validator(mode="after")
+def _check_assets(self) -> "LaunchPlan":
+    # Assets are optional. If provided, require at least one valid input.
+    if self.assets:
+        a = self.assets
+        has_any = any([
+            bool(a.image_hash),
+            bool(a.video_id),
+            bool(a.image_path),
+            bool(a.video_path),
+            bool(a.media_url),
+            bool(a.image_url),
+            bool(a.video_url),
+        ])
+        if not has_any:
+            raise ValueError(
+                "assets must include at least one of: image_hash, video_id, image_path, video_path, media_url, image_url, video_url"
+            )
+
+        # Safety: don't allow both image_hash and video_id.
+        if a.image_hash and a.video_id:
+            raise ValueError("assets cannot include both image_hash and video_id. Choose one media type.")
+
+    return self
 
     @model_validator(mode="after")
     def _check_product(self) -> "LaunchPlan":
@@ -704,6 +751,7 @@ class MetaClient:
         self.cfg = cfg
         self.session = requests.Session()
         self.base_url = f"https://graph.facebook.com/{cfg.api_version}"
+        self.video_base_url = f"https://graph-video.facebook.com/{cfg.api_version}"
 
     def _request(
         self,
@@ -714,8 +762,10 @@ class MetaClient:
         data: Optional[dict] = None,
         files: Optional[dict] = None,
         max_retries: int = 2,
+        use_video: bool = False,
     ) -> dict:
-        url = f"{self.base_url}/{path.lstrip('/')}"
+        base = self.video_base_url if use_video else self.base_url
+        url = base + "/" + path.lstrip("/")
         params = params or {}
         data = data or {}
 
@@ -952,6 +1002,93 @@ class MetaClient:
             raise MetaAPIError(f"Could not parse image_hash from response: {payload}")
         return image_hash
 
+
+
+def upload_video(
+    self,
+    *,
+    video_path: str | None = None,
+    video_bytes: bytes | None = None,
+    filename: str = "video.mp4",
+    file_url: str | None = None,
+    name: str | None = None,
+    ad_account_id: str | None = None,
+    wait_for_ready: bool = True,
+    wait_timeout_s: int = 600,
+    wait_poll_s: int = 5,
+) -> str:
+    """Upload a video and return the AdVideo id.
+
+    Supported inputs:
+      - file_url: remote URL to a video file (preferred for Make/Notion)
+      - video_path / video_bytes: local upload (dev/testing)
+
+    Notes:
+      - Uses graph-video domain for upload.
+      - Optionally waits until encoding is ready.
+    """
+    acct = normalize_ad_account_id(ad_account_id or self.cfg.ad_account_id)
+
+    if file_url:
+        data: Dict[str, Any] = {"file_url": file_url}
+        if name:
+            data["name"] = name
+        payload = self._request("POST", f"/{acct}/advideos", data=data, use_video=True)
+        video_id = str(payload.get("id") or "").strip()
+        if not video_id:
+            raise MetaAPIError(f"Video upload did not return id. Response: {payload}")
+    else:
+        if video_bytes is None:
+            if not video_path:
+                raise ValueError("Provide file_url, video_path, or video_bytes.")
+            p = Path(video_path)
+            if not p.exists():
+                raise FileNotFoundError(f"Video file not found: {p}")
+            video_bytes = p.read_bytes()
+            filename = p.name or filename
+
+        # Multipart upload; Meta expects 'source'
+        files = {"source": (filename, video_bytes, "video/mp4")}
+        data: Dict[str, Any] = {}
+        if name:
+            data["name"] = name
+        payload = self._request("POST", f"/{acct}/advideos", files=files, data=data, use_video=True)
+        video_id = str(payload.get("id") or "").strip()
+        if not video_id:
+            raise MetaAPIError(f"Video upload did not return id. Response: {payload}")
+
+    if wait_for_ready:
+        self.wait_for_video_ready(video_id, timeout_s=wait_timeout_s, poll_s=wait_poll_s)
+
+    return video_id
+
+
+def wait_for_video_ready(self, video_id: str, *, timeout_s: int = 600, poll_s: int = 5) -> None:
+    """Poll AdVideo status until it's ready (or timeout)."""
+    deadline = time.time() + max(10, int(timeout_s))
+    last_status = None
+
+    while time.time() < deadline:
+        obj = self.get_object(str(video_id), fields="status")
+        status = obj.get("status")
+
+        # status is usually a dict: {"video_status":"processing"|"ready", ...}
+        video_status = None
+        if isinstance(status, dict):
+            video_status = (status.get("video_status") or status.get("status") or "").strip().lower() or None
+            last_status = status
+        elif isinstance(status, str):
+            video_status = status.strip().lower() or None
+            last_status = status
+
+        if video_status in {"ready", "complete", "completed"}:
+            return
+        if video_status in {"error", "failed"}:
+            raise MetaAPIError(f"Video encoding failed for {video_id}. status={status}")
+
+        time.sleep(max(1, int(poll_s)))
+
+    raise MetaAPIError(f"Timed out waiting for video {video_id} to become ready. last_status={last_status}")
 
     def create_campaign(self, spec: CampaignSpec, *, dry_run: bool = False) -> str:
         acct = normalize_ad_account_id(self.cfg.ad_account_id)
@@ -1366,59 +1503,174 @@ def _fetch_and_normalize_image_bytes(url: str, *, timeout_s: int = 30) -> tuple[
 
     return jpeg_bytes, "image.jpg"
 
-def ensure_image_hash_for_plan(client, cfg, plan, *, dry_run: bool):
-    """
-    Ensures plan.assets.image_hash exists.
-    Supports: image_hash, image_path, image_url.
-    If image_url is used, downloads & normalizes to JPEG first.
-    Injects image_hash into creative.object_story_spec.link_data.image_hash.
-    Clears image_url/image_path so queued payload is stable.
-    """
-    # Nothing to do if no assets
+
+
+def _normalize_drive_download_url(url: str) -> str:
+    """Normalize common Google Drive share URLs to direct download."""
+    url = (url or "").strip()
+    if "drive.google.com/file/d/" in url:
+        file_id = url.split("/file/d/")[1].split("/")[0]
+        return f"https://drive.google.com/uc?export=download&id={file_id}"
+    return url
+
+
+def _guess_media_type_from_url(url: str) -> Optional[str]:
+    u = (url or "").lower()
+    for ext in (".mp4", ".mov", ".m4v", ".webm"):
+        if u.split("?")[0].endswith(ext):
+            return "video"
+    for ext in (".jpg", ".jpeg", ".png", ".webp", ".gif"):
+        if u.split("?")[0].endswith(ext):
+            return "image"
+    return None
+
+
+def _detect_media_type(url: str, *, timeout_s: int = 20) -> str:
+    """Detect media type (image/video) from URL."""
+    guess = _guess_media_type_from_url(url)
+    if guess:
+        return guess
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0 Safari/537.36"
+        ),
+        "Accept": "*/*",
+    }
+
+    try:
+        h = requests.head(url, headers=headers, timeout=timeout_s, allow_redirects=True)
+        ct = (h.headers.get("Content-Type") or "").lower()
+        if ct.startswith("image/"):
+            return "image"
+        if ct.startswith("video/"):
+            return "video"
+    except Exception:
+        pass
+
+    try:
+        headers2 = dict(headers)
+        headers2["Range"] = "bytes=0-1023"
+        g = requests.get(url, headers=headers2, timeout=timeout_s, allow_redirects=True)
+        ct = (g.headers.get("Content-Type") or "").lower()
+        if ct.startswith("image/"):
+            return "image"
+        if ct.startswith("video/"):
+            return "video"
+    except Exception:
+        pass
+
+    return "image"
+
+
+def inject_video_id(plan: 'LaunchPlan', video_id: str) -> 'LaunchPlan':
+    """Inject AdVideo id into creative.object_story_spec."""
+    oss = plan.creative.object_story_spec
+    if isinstance(oss, dict):
+        vd = oss.get("video_data")
+        if isinstance(vd, dict):
+            vd["video_id"] = video_id
+            vd.pop("image_hash", None)
+            return plan
+
+        ld = oss.get("link_data")
+        if isinstance(ld, dict):
+            new_vd = dict(ld)
+            new_vd.pop("image_hash", None)
+            new_vd["video_id"] = video_id
+            oss.pop("link_data", None)
+            oss["video_data"] = new_vd
+            return plan
+
+    raise ValueError(
+        "For video assets, creative.object_story_spec must contain video_data (preferred) or link_data (convertible)."
+    )
+
+
+def ensure_media_for_plan(client: 'MetaClient', cfg: MetaConfig, plan: 'LaunchPlan', *, dry_run: bool, stable_for_queue: bool) -> 'LaunchPlan':
+    """Ensure the plan has an uploaded asset reference (image_hash or video_id) and inject it into the creative."""
     if not getattr(plan, "assets", None):
         return plan
 
-    # Already have hash
-    if getattr(plan.assets, "image_hash", None):
-        image_hash = plan.assets.image_hash
-    else:
+    a = plan.assets
+
+    if getattr(a, "image_hash", None):
+        inject_image_hash(plan, a.image_hash)
+        return plan
+    if getattr(a, "video_id", None):
+        inject_video_id(plan, a.video_id)
+        return plan
+
+    media_url = (a.media_url or a.image_url or a.video_url or "").strip() or None
+    media_type = (a.media_type or "").strip().lower() or None
+
+    if media_url:
+        media_url = _normalize_drive_download_url(media_url)
+
+    if not media_type and media_url:
+        media_type = _detect_media_type(media_url, timeout_s=min(20, int(cfg.timeout_s)))
+
+    if not media_type:
+        if a.video_path:
+            media_type = "video"
+        elif a.image_path:
+            media_type = "image"
+
+    if not media_type:
+        return plan
+
+    if media_type == "image":
         image_hash = None
-
-        # Local file path (CLI/dev)
-        image_path = getattr(plan.assets, "image_path", None)
-        if image_path:
+        if a.image_path:
+            image_hash = "DRY_RUN_IMAGE_HASH" if dry_run else client.upload_image(image_path=a.image_path)
+        elif media_url:
             if dry_run:
                 image_hash = "DRY_RUN_IMAGE_HASH"
             else:
-                image_hash = client.upload_image(image_path=image_path)
-
-        # Remote URL (Make-friendly)
-        image_url = getattr(plan.assets, "image_url", None)
-        if (not image_hash) and image_url:
-            if dry_run:
-                image_hash = "DRY_RUN_IMAGE_HASH"
-            else:
-                img_bytes, fname = _fetch_and_normalize_image_bytes(image_url, timeout_s=cfg.timeout_s)
+                img_bytes, fname = _fetch_and_normalize_image_bytes(media_url, timeout_s=cfg.timeout_s)
                 image_hash = client.upload_image(image_bytes=img_bytes, filename=fname)
 
-    # If we resolved a hash, store it + inject into creative
-    if image_hash:
-        plan.assets.image_hash = image_hash
-        # Clear sources so queue doesn't store expiring URL/path
-        if hasattr(plan.assets, "image_url"):
-            plan.assets.image_url = None
-        if hasattr(plan.assets, "image_path"):
-            plan.assets.image_path = None
+        if image_hash:
+            a.image_hash = image_hash
+            a.image_url = None
+            a.media_url = None
+            a.image_path = None
+            inject_image_hash(plan, image_hash)
+        return plan
 
-        # Inject into creative.object_story_spec.link_data.image_hash
-        oss = plan.creative.object_story_spec
-        if isinstance(oss, dict):
-            link_data = oss.get("link_data")
-            if isinstance(link_data, dict):
-                link_data["image_hash"] = image_hash
+    if media_type == "video" and stable_for_queue:
+        return plan
+
+    if media_type == "video":
+        wait = (os.getenv("VIDEO_WAIT_FOR_READY", "true") or "true").strip().lower() not in {"0", "false", "no"}
+        timeout_s = int((os.getenv("VIDEO_WAIT_TIMEOUT_S", "600") or "600").strip() or "600")
+        poll_s = int((os.getenv("VIDEO_WAIT_POLL_S", "5") or "5").strip() or "5")
+
+        video_id = None
+        if a.video_path:
+            video_id = "DRY_RUN_VIDEO_ID" if dry_run else client.upload_video(video_path=a.video_path, name=plan.creative.name, wait_for_ready=wait, wait_timeout_s=timeout_s, wait_poll_s=poll_s)
+        elif media_url:
+            video_id = "DRY_RUN_VIDEO_ID" if dry_run else client.upload_video(file_url=media_url, name=plan.creative.name, wait_for_ready=wait, wait_timeout_s=timeout_s, wait_poll_s=poll_s)
+
+        if video_id:
+            a.video_id = video_id
+            a.video_url = None
+            a.media_url = None
+            a.video_path = None
+            a.image_url = None
+            a.image_path = None
+            inject_video_id(plan, video_id)
+
+        return plan
 
     return plan
 
+
+def ensure_image_hash_for_plan(client, cfg, plan, *, dry_run: bool):
+    """Backward-compatible wrapper (image-only)."""
+    return ensure_media_for_plan(client, cfg, plan, dry_run=dry_run, stable_for_queue=False)
 
 
 
@@ -1462,36 +1714,8 @@ def _run_launch_plan_v1(
         )
         store.delete_launch(launch_key)
 
-    # 1) Upload image if needed
-    image_hash: Optional[str] = None
-    if plan.assets:
-        if plan.assets.image_hash:
-            image_hash = plan.assets.image_hash
-
-        elif plan.assets.image_path:
-            if dry_run:
-                print("[DRY RUN] upload_image:", plan.assets.image_path)
-                image_hash = "DRY_RUN_IMAGE_HASH"
-            else:
-                image_hash = client.upload_image(image_path=plan.assets.image_path)
-
-        elif plan.assets.image_url:
-            if dry_run:
-                print("[DRY RUN] download+normalize+upload image_url:", plan.assets.image_url)
-                image_hash = "DRY_RUN_IMAGE_HASH"
-            else:
-                img_bytes, fname = _fetch_and_normalize_image_bytes(
-                    plan.assets.image_url,
-                    timeout_s=cfg.timeout_s,
-                )
-                image_hash = client.upload_image(
-                    image_bytes=img_bytes,
-                    filename=fname,
-                )
-
-
-    if image_hash:
-        plan = inject_image_hash(plan, image_hash)
+    # 1) Resolve assets (image/video) if provided
+    plan = ensure_media_for_plan(client, cfg, plan, dry_run=dry_run, stable_for_queue=False)
 
     # 2) Get-or-create campaign based on product
     campaign_name = resolve_campaign_name(plan.product)
@@ -1940,7 +2164,7 @@ def _drain_queue_group_v2(
                     continue
 
                 p = LaunchPlan.model_validate(r.payload)
-                p = ensure_image_hash_for_plan(client, cfg, p, dry_run=dry_run)
+                p = ensure_media_for_plan(client, cfg, p, dry_run=dry_run, stable_for_queue=False)
 
                 vid, var, _ = parse_video_name_v2(p.creative.name)
                 base_name = build_ad_base_name_v2(vid, var, p.product_label or "")
@@ -2054,7 +2278,7 @@ def _run_launch_plan_v2(
     sig = f"{sig}:{(plan.audience or '').strip()}"
 
     # ✅ Resolve image_url/image_path -> image_hash BEFORE storing payload in queue
-    plan = ensure_image_hash_for_plan(client, cfg, plan, dry_run=dry_run)
+    plan = ensure_media_for_plan(client, cfg, plan, dry_run=dry_run, stable_for_queue=True)
 
     row_id = qstore.enqueue(
         product=plan.product,
@@ -2307,7 +2531,7 @@ def _run_launch_plan_v2(
                     continue
 
                 p = LaunchPlan.model_validate(r.payload)
-                p = ensure_image_hash_for_plan(client, cfg, p, dry_run=dry_run)
+                p = ensure_media_for_plan(client, cfg, p, dry_run=dry_run, stable_for_queue=False)
 
                 # Final naming
                 vid, var, _ = parse_video_name_v2(p.creative.name)

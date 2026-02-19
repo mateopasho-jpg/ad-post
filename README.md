@@ -76,7 +76,10 @@ curl -X POST http://localhost:8080/run \
 
 Notes:
 - If you do not set `SERVICE_API_KEY`, you can omit the `X-API-Key` header.
-- For automation (Notion/Make), prefer `assets.image_url` over `assets.image_path`.
+- For automation (Notion/Make), prefer `assets.media_url` (image **or** video).
+  - If you set `assets.media_type` to `video`, the backend will upload a video and inject `video_id`.
+  - If you omit `assets.media_type`, the backend will auto-detect from the URL/content-type.
+  - For video creatives, `creative.object_story_spec` should contain `video_data` (preferred).
 
 
 ## Worker (recommended for Railway)
@@ -339,3 +342,10 @@ Run:
 ```bash
 docker run --rm -p 8080:8080 --env-file .env meta-ads-tool:latest
 ```
+
+### Video upload controls
+
+Environment variables:
+- `VIDEO_WAIT_FOR_READY` (default `true`) — wait until Meta finishes encoding before creating the ad
+- `VIDEO_WAIT_TIMEOUT_S` (default `600`)
+- `VIDEO_WAIT_POLL_S` (default `5`)
