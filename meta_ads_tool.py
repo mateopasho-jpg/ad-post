@@ -44,6 +44,8 @@ from token_store import get_valid_access_token
 import io
 from PIL import Image
 import re
+from urllib.parse import urlparse, parse_qs
+
 
 import requests
 
@@ -1543,12 +1545,15 @@ def _fetch_and_normalize_image_bytes(url: str, *, timeout_s: int = 30) -> tuple[
     """
     Downloads an image URL, normalizes it to a Meta-safe JPEG,
     and returns (jpeg_bytes, filename).
+
+    Includes Google Drive "virus scan warning" bypass.
     """
     url = (url or "").strip()
     if not url.lower().startswith(("http://", "https://")):
         raise ValueError("image_url must start with http:// or https://")
 
-    # Normalize Google Drive "view" links -> direct download
+    # Normalize Google Drive "file" links -> direct download
+    file_id = None
     if "drive.google.com/file/d/" in url:
         file_id = url.split("/file/d/")[1].split("/")[0]
         url = f"https://drive.google.com/uc?export=download&id={file_id}"
@@ -1563,27 +1568,76 @@ def _fetch_and_normalize_image_bytes(url: str, *, timeout_s: int = 30) -> tuple[
         "Accept-Language": "en-US,en;q=0.9",
     }
 
-    resp = _download_url_follow_drive_confirm(url, timeout_s=timeout_s)
+    # Use a session so cookies persist (needed for Drive confirm flow)
+    s = requests.Session()
+    resp = s.get(url, headers=headers, timeout=timeout_s, allow_redirects=True)
     resp.raise_for_status()
 
     ct = (resp.headers.get("Content-Type") or "").lower()
     raw = resp.content or b""
 
-    # Guard: if it's tiny, it's almost certainly not an image (prevents Meta "file_size: 8")
+    # If we got HTML, try Google Drive virus-warning confirm flow
+    head = raw[:2048].lstrip().lower()
+    is_html = ("text/html" in ct) or head.startswith(b"<!doctype html") or head.startswith(b"<html")
+    if is_html:
+        text = raw[:200_000].decode("utf-8", errors="ignore").lower()
+
+        # Detect Drive virus scan warning page
+        if "google drive - virus scan warning" in text or "virus scan warning" in text:
+            # Attempt to extract confirm token from HTML
+            m = re.search(r"confirm=([0-9a-zA-Z_]+)", text)
+            if not m:
+                raise ValueError(
+                    f"Google Drive returned virus scan warning HTML and confirm token was not found. "
+                    f"final_url={resp.url}"
+                )
+            confirm = m.group(1)
+
+            # Try to recover the file id from the final URL if we didn't have it
+            if not file_id:
+                qs = parse_qs(urlparse(resp.url).query)
+                file_id = (qs.get("id") or [None])[0]
+
+            if not file_id:
+                raise ValueError(
+                    f"Google Drive virus scan warning detected, but could not determine file id. final_url={resp.url}"
+                )
+
+            # Re-request with confirm token (this is what the UI does)
+            retry_url = "https://drive.google.com/uc"
+            resp = s.get(
+                retry_url,
+                params={"export": "download", "id": file_id, "confirm": confirm},
+                headers=headers,
+                timeout=timeout_s,
+                allow_redirects=True,
+            )
+            resp.raise_for_status()
+            ct = (resp.headers.get("Content-Type") or "").lower()
+            raw = resp.content or b""
+
+            # Re-check HTML after retry
+            head = raw[:2048].lstrip().lower()
+            is_html = ("text/html" in ct) or head.startswith(b"<!doctype html") or head.startswith(b"<html")
+            if is_html:
+                raise ValueError(
+                    f"Google Drive confirm retry still returned HTML (likely permissions). "
+                    f"content-type={ct} final_url={resp.url} preview={raw[:200]!r}"
+                )
+        else:
+            # Any other HTML (permissions/login page/etc) should still error
+            raise ValueError(
+                f"URL returned HTML, not an image. content-type={ct} final_url={resp.url} preview={raw[:200]!r}"
+            )
+
+    # Guard: tiny content isn't an image
     if len(raw) < 1024:
         raise ValueError(
             f"Downloaded content too small to be an image ({len(raw)} bytes). "
             f"content-type={ct} final_url={resp.url} preview={raw[:200]!r}"
         )
 
-    # Guard: HTML means "not actually an image" (Notion/Drive permission pages)
-    head = raw[:512].lstrip().lower()
-    if "text/html" in ct or head.startswith(b"<!doctype html") or head.startswith(b"<html"):
-        raise ValueError(
-            f"URL returned HTML, not an image. content-type={ct} final_url={resp.url} preview={raw[:200]!r}"
-        )
-
-
+    # Decode & normalize to JPEG
     try:
         img = Image.open(io.BytesIO(raw))
         img = img.convert("RGB")
@@ -1598,6 +1652,7 @@ def _fetch_and_normalize_image_bytes(url: str, *, timeout_s: int = 30) -> tuple[
         raise ValueError("JPEG re-encode failed; output too small")
 
     return jpeg_bytes, "image.jpg"
+
 
 
 
