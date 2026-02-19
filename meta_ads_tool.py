@@ -1579,26 +1579,88 @@ def _detect_media_type(url: str, *, timeout_s: int = 20) -> str:
 
 
 def inject_video_id(plan: 'LaunchPlan', video_id: str) -> 'LaunchPlan':
-    """Inject AdVideo id into creative.object_story_spec."""
-    oss = plan.creative.object_story_spec
-    if isinstance(oss, dict):
-        vd = oss.get("video_data")
-        if isinstance(vd, dict):
-            vd["video_id"] = video_id
-            vd.pop("image_hash", None)
-            return plan
+    """Inject AdVideo id into creative.object_story_spec.
 
-        ld = oss.get("link_data")
-        if isinstance(ld, dict):
-            new_vd = dict(ld)
-            new_vd.pop("image_hash", None)
-            new_vd["video_id"] = video_id
-            oss.pop("link_data", None)
-            oss["video_data"] = new_vd
-            return plan
+    ⚠️ Meta requires `object_story_spec.video_data` to NOT include a top-level `link` field.
+    The destination URL must be provided as `call_to_action.value.link`.
+
+    This helper:
+      - injects `video_id`
+      - removes unsupported fields (`image_hash`, top-level `link`)
+      - converts `link_data` (image-style spec) into valid `video_data`
+    """
+
+    def _ensure_cta_link(vd: dict, link: str | None) -> dict:
+        if not link:
+            return vd
+        cta = vd.get('call_to_action')
+        if not isinstance(cta, dict):
+            vd['call_to_action'] = {'type': 'LEARN_MORE', 'value': {'link': link}}
+            return vd
+        val = cta.get('value')
+        if not isinstance(val, dict):
+            val = {}
+            cta['value'] = val
+        val.setdefault('link', link)
+        vd['call_to_action'] = cta
+        return vd
+
+    oss = plan.creative.object_story_spec
+    if not isinstance(oss, dict):
+        raise ValueError(
+            'For video assets, creative.object_story_spec must be a dict containing video_data or link_data.'
+        )
+
+    # Case A: already has video_data -> sanitize
+    vd = oss.get('video_data')
+    if isinstance(vd, dict):
+        vd = dict(vd)
+        vd['video_id'] = video_id
+        vd.pop('image_hash', None)
+
+        # Some builders mistakenly include `link` at the top level -> convert to CTA
+        link = vd.pop('link', None)
+        vd = _ensure_cta_link(vd, link)
+
+        oss.pop('link_data', None)
+        oss['video_data'] = vd
+        return plan
+
+    # Case B: has link_data (image-style) -> convert to video_data
+    ld = oss.get('link_data')
+    if isinstance(ld, dict):
+        ld = dict(ld)
+        ld.pop('image_hash', None)
+
+        # Map only fields that are valid for video_data.
+        new_vd: dict[str, Any] = {'video_id': video_id}
+        if ld.get('message') is not None:
+            new_vd['message'] = ld.get('message')
+        if ld.get('name') is not None:
+            new_vd['title'] = ld.get('name')
+        if ld.get('description') is not None:
+            new_vd['link_description'] = ld.get('description')
+
+        link = ld.get('link')
+        cta = ld.get('call_to_action')
+        if isinstance(cta, dict):
+            cta = dict(cta)
+            if link:
+                val = cta.get('value')
+                if not isinstance(val, dict):
+                    val = {}
+                val.setdefault('link', link)
+                cta['value'] = val
+            new_vd['call_to_action'] = cta
+        elif link:
+            new_vd['call_to_action'] = {'type': 'LEARN_MORE', 'value': {'link': link}}
+
+        oss.pop('link_data', None)
+        oss['video_data'] = new_vd
+        return plan
 
     raise ValueError(
-        "For video assets, creative.object_story_spec must contain video_data (preferred) or link_data (convertible)."
+        'For video assets, creative.object_story_spec must contain video_data (preferred) or link_data (convertible).'
     )
 
 
