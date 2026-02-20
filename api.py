@@ -258,11 +258,11 @@ def drain_queue(
 
 @app.post("/run-multipart")
 async def run_multipart(
+    background_tasks: BackgroundTasks,
     plan: str = Form(..., description="LaunchPlan JSON as a string"),
     dry_run: bool = Form(False),
     job_id: Optional[str] = Form(None),
     image_file: UploadFile | None = File(None, description="Image file (jpg/png/etc)"),
-    background_tasks: BackgroundTasks,
     x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
 ) -> Dict[str, Any]:
     """
