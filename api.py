@@ -250,6 +250,16 @@ def drain_queue(
                 dry_run=False,
             )
             drained.append({"group": g, "result": out})
+        except MetaAPIError as e:
+            # Return structured Meta error details so callers can fix bad parameters.
+            drained.append(
+                {
+                    "group": g,
+                    "error": str(e),
+                    "http_status": getattr(e, "http_status", None),
+                    "meta_error": getattr(e, "error", None),
+                }
+            )
         except Exception as e:
             drained.append({"group": g, "error": str(e)})
 
