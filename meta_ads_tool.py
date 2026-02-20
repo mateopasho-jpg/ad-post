@@ -1826,8 +1826,17 @@ def _guess_media_type_from_url(url: str) -> Optional[str]:
     return None
 
 
-def _detect_media_type(url: str, *, timeout_s: int = 20) -> str:
-    """Detect media type (image/video) from URL."""
+def _detect_media_type(url: str, *, timeout_s: int = 20) -> Optional[str]:
+    """Best-effort detect media type ('image' | 'video') from URL.
+
+    We try (in order):
+      1) filename/extension heuristics
+      2) HEAD content-type
+      3) GET range content-type
+      4) sniff first bytes (JPEG/PNG/WEBP/MP4/MOV)
+    If the URL returns HTML (e.g. Google Drive virus-scan warning / permission page),
+    we return None so callers can fail with a clear error instead of misclassifying.
+    """
     guess = _guess_media_type_from_url(url)
     if guess:
         return guess
@@ -1841,29 +1850,56 @@ def _detect_media_type(url: str, *, timeout_s: int = 20) -> str:
         "Accept": "*/*",
     }
 
+    def _ct_to_type(ct: str) -> Optional[str]:
+        ct = (ct or "").lower()
+        if ct.startswith("image/"):
+            return "image"
+        if ct.startswith("video/"):
+            return "video"
+        if "text/html" in ct:
+            return None
+        return None
+
+    # 2) HEAD
     try:
         h = requests.head(url, headers=headers, timeout=timeout_s, allow_redirects=True)
-        ct = (h.headers.get("Content-Type") or "").lower()
-        if ct.startswith("image/"):
-            return "image"
-        if ct.startswith("video/"):
-            return "video"
+        t = _ct_to_type(h.headers.get("Content-Type") or "")
+        if t:
+            return t
     except Exception:
         pass
 
+    # 3) GET small range
+    body = b""
     try:
         headers2 = dict(headers)
-        headers2["Range"] = "bytes=0-1023"
+        headers2["Range"] = "bytes=0-2047"
         g = requests.get(url, headers=headers2, timeout=timeout_s, allow_redirects=True)
-        ct = (g.headers.get("Content-Type") or "").lower()
-        if ct.startswith("image/"):
-            return "image"
-        if ct.startswith("video/"):
-            return "video"
+        t = _ct_to_type(g.headers.get("Content-Type") or "")
+        if t:
+            return t
+        body = g.content or b""
     except Exception:
         pass
 
-    return "image"
+    # 4) Sniff bytes
+    if body:
+        head = body[:2048].lstrip()
+        # HTML interstitials (Drive, auth pages)
+        if head.startswith(b"<!doctype html") or head.startswith(b"<html") or head.startswith(b"<!DOCTYPE html"):
+            return None
+        # JPEG / PNG / WEBP
+        if head.startswith(b"\xFF\xD8\xFF"):
+            return "image"
+        if head.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "image"
+        if head.startswith(b"RIFF") and b"WEBP" in head[:16]:
+            return "image"
+        # MP4/MOV: 'ftyp' box near start
+        if len(head) > 12 and head[4:8] == b"ftyp":
+            return "video"
+
+    return None
 
 
 def inject_video_id(plan: 'LaunchPlan', video_id: str, *, thumbnail_url: Optional[str] = None) -> 'LaunchPlan':
@@ -2246,16 +2282,23 @@ def apply_flexible_text_variants(plan: 'LaunchPlan') -> 'LaunchPlan':
         if opts.descriptions:
             afs["descriptions"] = [{"text": t} for t in opts.descriptions]
 
-        # Attach media for the feed so Meta can render variations.
-        if image_hash:
-            afs["images"] = [{"hash": image_hash}]
+        # Attach media for the feed. IMPORTANT: Meta requires exactly ONE ad format.
+        # If we include both images and videos in the feed, Meta treats it as multiple formats and rejects it.
         if video_id:
+            afs["ad_formats"] = ["SINGLE_VIDEO"]
             vobj: Dict[str, Any] = {"video_id": video_id}
             if thumb_hash:
                 vobj["thumbnail_hash"] = thumb_hash
             elif thumb_url:
                 vobj["thumbnail_url"] = thumb_url
             afs["videos"] = [vobj]
+        elif image_hash:
+            afs["ad_formats"] = ["SINGLE_IMAGE"]
+            afs["images"] = [{"hash": image_hash}]
+        else:
+            # No media to attach -> cannot build a valid asset feed creative.
+            plan.creative.object_story_spec = oss
+            return plan
 
         plan.creative.asset_feed_spec = afs
 
