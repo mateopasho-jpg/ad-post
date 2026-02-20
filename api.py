@@ -46,13 +46,17 @@ import json
 import os
 from typing import Any, Dict, Optional
 
-from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile, BackgroundTasks
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError
 from PIL import Image
 
 from meta_ads_tool import (
+    build_idempotency_store,
+    build_queue_store,
+    compute_adset_signature_v2,
+    _drain_queue_group_v2,
     AssetsSpec,
     LaunchPlan,
     MetaAPIError,
@@ -112,6 +116,34 @@ def _normalize_to_jpeg_bytes(raw: bytes) -> bytes:
     return jpeg_bytes
 
 
+def _get_stores() -> tuple[Any, Any, str, str]:
+    """Build idempotency + queue stores using env configuration."""
+    store_path = (os.getenv("IDEMPOTENCY_DB_PATH") or ".meta_idempotency.db").strip() or ".meta_idempotency.db"
+    queue_db_path = (os.getenv("QUEUE_DB_PATH") or ".queue_state.db").strip() or ".queue_state.db"
+    store = build_idempotency_store(store_path)
+    qstore = build_queue_store(queue_db_path)
+    return store, qstore, store_path, queue_db_path
+
+
+def _background_drain_group_v2(cfg: MetaConfig, *, product: str, category: str, signature: str) -> None:
+    """Attempt to drain a single queue group (used as a background task)."""
+    try:
+        store, qstore, _, _ = _get_stores()
+        _drain_queue_group_v2(
+            cfg,
+            qstore=qstore,
+            store=store,
+            product=product,
+            category=category,
+            signature=signature,
+            dry_run=False,
+        )
+    except Exception:
+        # Best-effort: never fail the request because the background drain failed.
+        pass
+
+
+
 @app.get("/")
 def root() -> JSONResponse:
     return JSONResponse({"ok": True, "docs": "/docs", "health": "/health"})
@@ -123,7 +155,7 @@ def health() -> Dict[str, Any]:
 
 
 @app.post("/run")
-def run(req: RunRequest, x_api_key: Optional[str] = Header(default=None, alias="X-API-Key")) -> Dict[str, Any]:
+def run(req: RunRequest, background_tasks: BackgroundTasks, x_api_key: Optional[str] = Header(default=None, alias="X-API-Key")) -> Dict[str, Any]:
     _require_api_key(x_api_key)
 
     try:
@@ -136,6 +168,23 @@ def run(req: RunRequest, x_api_key: Optional[str] = Header(default=None, alias="
     try:
         plan = LaunchPlan.model_validate(req.plan)
         result = run_launch_plan(cfg, plan, store_path=store_path, dry_run=req.dry_run)
+
+        # Make.com often times out around ~40s. For schema v2 batching, we enqueue quickly and
+        # trigger a best-effort background drain (so the HTTP response is fast and reliable).
+        if (not req.dry_run) and getattr(plan, "schema_version", 1) >= 2 and bool(getattr(plan, "batching", False)):
+            try:
+                sig = compute_adset_signature_v2(plan.adset)
+                category = (plan.category or "ug")
+                background_tasks.add_task(
+                    _background_drain_group_v2,
+                    cfg,
+                    product=plan.product,
+                    category=category,
+                    signature=sig,
+                )
+            except Exception:
+                pass
+
         return {"ok": True, "job_id": req.job_id, "result": result}
 
     except ValidationError as e:
@@ -151,6 +200,58 @@ def run(req: RunRequest, x_api_key: Optional[str] = Header(default=None, alias="
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+
+
+@app.get("/queue")
+def queue_groups(
+    limit: int = 50,
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+) -> Dict[str, Any]:
+    """Debug endpoint: list current batching queue groups."""
+    _require_api_key(x_api_key)
+    _, qstore, _, _ = _get_stores()
+    groups = qstore.list_groups(limit=int(limit))
+    return {"ok": True, "limit": int(limit), "groups": groups}
+
+
+@app.post("/drain")
+def drain_queue(
+    limit: int = 50,
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+) -> Dict[str, Any]:
+    """Drain all eligible queue groups once.
+
+    Use this if you don't want a separate worker service. Call it on a schedule (e.g. every minute).
+    """
+    _require_api_key(x_api_key)
+
+    try:
+        cfg = MetaConfig.from_env()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Server misconfigured: {e}")
+
+    store, qstore, _, _ = _get_stores()
+    groups = qstore.list_groups(limit=int(limit))
+
+    drained: list[dict] = []
+    for g in groups:
+        try:
+            out = _drain_queue_group_v2(
+                cfg,
+                qstore=qstore,
+                store=store,
+                product=g["product"],
+                category=g["category"],
+                signature=g["signature"],
+                dry_run=False,
+            )
+            drained.append({"group": g, "result": out})
+        except Exception as e:
+            drained.append({"group": g, "error": str(e)})
+
+    return {"ok": True, "groups_scanned": len(groups), "results": drained}
 
 
 @app.post("/run-multipart")
@@ -223,6 +324,21 @@ async def run_multipart(
             plan_obj.assets.image_path = None
 
         result = run_launch_plan(cfg, plan_obj, store_path=store_path, dry_run=dry_run)
+
+        if (not dry_run) and getattr(plan_obj, "schema_version", 1) >= 2 and bool(getattr(plan_obj, "batching", False)):
+            try:
+                sig = compute_adset_signature_v2(plan_obj.adset)
+                category = (plan_obj.category or "ug")
+                background_tasks.add_task(
+                    _background_drain_group_v2,
+                    cfg,
+                    product=plan_obj.product,
+                    category=category,
+                    signature=sig,
+                )
+            except Exception:
+                pass
+
         return {"ok": True, "job_id": job_id, "result": result, "debug": debug}
 
     except json.JSONDecodeError as e:

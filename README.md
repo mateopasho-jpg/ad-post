@@ -82,15 +82,34 @@ Notes:
   - For video creatives, `creative.object_story_spec` should contain `video_data` (preferred).
 
 
+## Queue & batching behavior (schema v2)
+
+Schema v2 defaults to **batching** (queue + flush into AdSets). The API will **enqueue quickly** and may return `result.queued=true`.
+
+To make batching reliable in production you have two options:
+- **Recommended:** run the included `worker.py` as a second Railway service.
+- **Alternative:** call `POST /drain` on a schedule (e.g. every minute) from Make.
+
+Debug helpers:
+- `GET /queue` shows current queue groups (unique videos + age).
+- `POST /drain` attempts to flush all eligible groups once.
+
+
 ## Worker (recommended for Railway)
 
 Schema v2 uses a **time-based fallback** (e.g. allow 3 items after 60s).
 If no new webhook arrives after the 3rd item, you still want the batch to flush — that’s what the worker does.
 
-Run the worker locally:
+Run the worker locally (recommended):
 
 ```bash
 python worker.py
+```
+
+If you do **not** want a separate worker service, schedule `POST /drain` instead:
+
+```bash
+curl -X POST http://localhost:8080/drain
 ```
 
 ### Railway setup

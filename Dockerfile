@@ -14,4 +14,4 @@ COPY . /app
 # Default port used by many platforms (Cloud Run sets $PORT)
 ENV PORT=8080
 
-CMD ["bash", "-lc", "uvicorn api:app --host 0.0.0.0 --port ${PORT}"]
+CMD ["bash", "-lc", "uvicorn api:app --host 0.0.0.0 --port ${PORT} --proxy-headers --timeout-keep-alive 75 --workers ${WEB_CONCURRENCY:-1}"]

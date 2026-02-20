@@ -2896,7 +2896,7 @@ def _run_launch_plan_v2(
 
     # Optional: if you run a dedicated worker on Railway, disable immediate draining
     # in the API service to avoid races / duplicate AdSet numbering.
-    immediate = (os.getenv("ENABLE_IMMEDIATE_DRAIN", "true") or "true").strip().lower() not in {"0", "false", "no"}
+    immediate = (os.getenv("ENABLE_IMMEDIATE_DRAIN", "false") or "true").strip().lower() not in {"0", "false", "no"}
     if not immediate:
         age_s = int((utcnow() - oldest_created_at).total_seconds())
         msg = (
