@@ -1617,13 +1617,35 @@ def _fetch_and_normalize_image_bytes(url: str, *, timeout_s: int = 30) -> tuple[
 
         # Drive virus scan warning page -> extract confirm token and retry download.
         if "virus scan warning" in lower and "google drive" in lower:
+            # The interstitial format varies. Try several ways to extract a confirm token.
+            confirm = None
+
+            # 1) Old-style: token appears in a URL like ...&confirm=XYZ&id=...
             m = re.search(r"confirm=([0-9a-zA-Z_]+)", text)
-            if not m:
+            if m:
+                confirm = m.group(1)
+
+            # 2) New-style: hidden input in a form: <input type="hidden" name="confirm" value="t">
+            if not confirm:
+                m = re.search(r'name=["\']confirm["\']\s+value=["\']([^"\']+)["\']', text, flags=re.I)
+                if m:
+                    confirm = m.group(1)
+
+            # 3) Cookie-based: Google sets a download_warning cookie; pass its value as confirm
+            if not confirm:
+                try:
+                    for k, v in resp.cookies.items():
+                        if k.startswith("download_warning") and v:
+                            confirm = v
+                            break
+                except Exception:
+                    pass
+
+            if not confirm:
                 raise ValueError(
                     f"URL returned Google Drive virus scan warning HTML but confirm token was not found. "
                     f"content-type={ct} final_url={resp.url} preview={raw[:200]!r}"
                 )
-            confirm = m.group(1)
 
             # Try to recover file id from the final URL (works for drive.usercontent.google.com/download?...id=...)
             qs = parse_qs(urlparse(resp.url).query)

@@ -65,7 +65,7 @@ from meta_ads_tool import (
     run_launch_plan,
 )
 
-app = FastAPI(title="Meta Ads Tool API", version="1.1.0")
+app = FastAPI(title="Meta Ads Tool API", version="1.1.1")
 
 
 class RunRequest(BaseModel):
@@ -198,6 +198,8 @@ def run(req: RunRequest, background_tasks: BackgroundTasks, x_api_key: Optional[
                 "meta_error": e.error,
             },
         )
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -356,5 +358,7 @@ async def run_multipart(
         )
     except HTTPException:
         raise
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
