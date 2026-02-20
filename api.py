@@ -65,7 +65,7 @@ from meta_ads_tool import (
     run_launch_plan,
 )
 
-app = FastAPI(title="Meta Ads Tool API", version="1.1.1")
+app = FastAPI(title="Meta Ads Tool API", version="1.1.2")
 
 
 class RunRequest(BaseModel):
@@ -262,6 +262,7 @@ async def run_multipart(
     dry_run: bool = Form(False),
     job_id: Optional[str] = Form(None),
     image_file: UploadFile | None = File(None, description="Image file (jpg/png/etc)"),
+    background_tasks: BackgroundTasks,
     x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
 ) -> Dict[str, Any]:
     """

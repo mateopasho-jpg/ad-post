@@ -1577,10 +1577,8 @@ def _fetch_and_normalize_image_bytes(url: str, *, timeout_s: int = 30) -> tuple[
     if not url.lower().startswith(("http://", "https://")):
         raise ValueError("image_url must start with http:// or https://")
 
-    # Normalize Google Drive "view" links -> direct download
-    if "drive.google.com/file/d/" in url:
-        file_id = url.split("/file/d/")[1].split("/")[0]
-        url = f"https://drive.google.com/uc?export=download&id={file_id}"
+    # Normalize Google Drive links (including drive.usercontent) -> canonical direct download
+    url = _normalize_drive_download_url(url)
 
     headers = {
         "User-Agent": (
@@ -1617,35 +1615,72 @@ def _fetch_and_normalize_image_bytes(url: str, *, timeout_s: int = 30) -> tuple[
 
         # Drive virus scan warning page -> extract confirm token and retry download.
         if "virus scan warning" in lower and "google drive" in lower:
-            # The interstitial format varies. Try several ways to extract a confirm token.
+            # The interstitial format varies a lot. We'll try multiple extraction strategies,
+            # and if we still can't get a token we fall back to confirm='t' (best-effort).
             confirm = None
+            used_fallback_confirm = False
 
-            # 1) Old-style: token appears in a URL like ...&confirm=XYZ&id=...
-            m = re.search(r"confirm=([0-9a-zA-Z_]+)", text)
+            # 1) Any confirm=... found anywhere in the HTML (allow '-', '.', etc.)
+            m = re.search(r"confirm=([^&\"'\s]+)", text)
             if m:
                 confirm = m.group(1)
 
-            # 2) New-style: hidden input in a form: <input type="hidden" name="confirm" value="t">
+            # 1b) Common link: <a id='uc-download-link' href='...confirm=XYZ...'>
             if not confirm:
-                m = re.search(r'name=["\']confirm["\']\s+value=["\']([^"\']+)["\']', text, flags=re.I)
+                m = re.search(r"id=[\"']uc-download-link[\"'][^>]+href=[\"']([^\"']+)[\"']", text, flags=re.I)
+                if m:
+                    href = m.group(1).replace('&amp;', '&')
+                    m2 = re.search(r"confirm=([^&\"'\s]+)", href)
+                    if m2:
+                        confirm = m2.group(1)
+
+            # 1c) Sometimes the confirm URL is embedded as a JS/JSON field like downloadUrl:"..."
+            if not confirm:
+                m = re.search(r"downloadUrl[\"']\s*[:=]\s*[\"']([^\"']+)[\"']", text, flags=re.I)
+                if m:
+                    dl = m.group(1)
+                    # undo some common escaping
+                    dl = dl.replace('\\u0026', '&').replace('\\u003d', '=').replace('&amp;', '&')
+                    try:
+                        dl = bytes(dl, 'utf-8').decode('unicode_escape')
+                    except Exception:
+                        pass
+                    m2 = re.search(r"confirm=([^&\"'\s]+)", dl)
+                    if m2:
+                        confirm = m2.group(1)
+
+            # 2) Hidden input in a form: <input type='hidden' name='confirm' value='t'>
+            if not confirm:
+                m = re.search(r"name=[\"']confirm[\"']\s+value=[\"']([^\"']+)[\"']", text, flags=re.I)
                 if m:
                     confirm = m.group(1)
 
-            # 3) Cookie-based: Google sets a download_warning cookie; pass its value as confirm
+            # 3) Cookie-based: download_warning* cookies (may be on resp or session)
             if not confirm:
                 try:
-                    for k, v in resp.cookies.items():
-                        if k.startswith("download_warning") and v:
+                    def _iter_cookie_items():
+                        # response cookies
+                        for k, v in resp.cookies.items():
+                            yield k, v
+                        # session cookies (can differ by domain)
+                        for c in getattr(sess, 'cookies', []):
+                            try:
+                                yield getattr(c, 'name', None), getattr(c, 'value', None)
+                            except Exception:
+                                continue
+
+                    for k, v in _iter_cookie_items():
+                        kk = (k or '').lower()
+                        if (('download_warning' in kk) or ('warning' in kk)) and v:
                             confirm = v
                             break
                 except Exception:
                     pass
 
+            # 4) Last resort: try a generic confirm token (may work for some interstitial variants).
             if not confirm:
-                raise ValueError(
-                    f"URL returned Google Drive virus scan warning HTML but confirm token was not found. "
-                    f"content-type={ct} final_url={resp.url} preview={raw[:200]!r}"
-                )
+                confirm = 't'
+                used_fallback_confirm = True
 
             # Try to recover file id from the final URL (works for drive.usercontent.google.com/download?...id=...)
             qs = parse_qs(urlparse(resp.url).query)
@@ -1660,11 +1695,22 @@ def _fetch_and_normalize_image_bytes(url: str, *, timeout_s: int = 30) -> tuple[
                 raise ValueError(
                     f"Google Drive virus scan warning detected, but could not determine file id. final_url={resp.url}"
                 )
+            # Retry on the SAME host/path we just hit (Drive uses multiple domains).
+            # Keep any existing query params (e.g., uuid) and add confirm.
+            final_p = urlparse(resp.url)
+            retry_url = f"{final_p.scheme}://{final_p.netloc}{final_p.path}"
+            base_qs = parse_qs(final_p.query)
+            params = {k: (v[-1] if isinstance(v, list) and v else v) for k, v in base_qs.items()}
+            # Ensure the file id is present.
+            if not params.get("id") and file_id:
+                params["id"] = file_id
+            # Preserve/export download.
+            params.setdefault("export", "download")
+            params["confirm"] = confirm
 
-            retry_url = "https://drive.google.com/uc"
             resp = sess.get(
                 retry_url,
-                params={"export": "download", "id": file_id, "confirm": confirm},
+                params=params,
                 headers=headers,
                 timeout=timeout_s,
                 allow_redirects=True,
@@ -1675,6 +1721,13 @@ def _fetch_and_normalize_image_bytes(url: str, *, timeout_s: int = 30) -> tuple[
             head = raw[:2048].lstrip().lower()
             is_html = ("text/html" in ct) or head.startswith(b"<!doctype html") or head.startswith(b"<html")
             if is_html:
+                if used_fallback_confirm:
+                    raise ValueError(
+                        "Google Drive returned a virus scan warning page, but a confirm token could not be extracted. "
+                        "This link type is not reliably downloadable by a server. "
+                        "Fix: use the /run-multipart endpoint (upload the file bytes) or host the image on a direct-download URL. "
+                        f"content-type={ct} final_url={resp.url} preview={raw[:200]!r}"
+                    )
                 raise ValueError(
                     f"Google Drive confirm retry still returned HTML (likely permissions). "
                     f"content-type={ct} final_url={resp.url} preview={raw[:200]!r}"
@@ -1703,11 +1756,62 @@ def _fetch_and_normalize_image_bytes(url: str, *, timeout_s: int = 30) -> tuple[
 
 
 def _normalize_drive_download_url(url: str) -> str:
-    """Normalize common Google Drive share URLs to direct download."""
+    """Normalize common Google Drive share/download URLs to a canonical direct-download endpoint.
+
+    This keeps the downloader stable even when users paste a mix of:
+      - drive.google.com/file/d/<ID>/view
+      - drive.google.com/open?id=<ID>
+      - drive.google.com/uc?id=<ID>&export=download
+      - drive.usercontent.google.com/download?id=<ID>&export=download
+
+    We normalize everything to:
+      https://drive.google.com/uc?export=download&id=<ID>
+
+    Note: Some large files still require a confirm-token flow; that's handled in the downloader.
+    """
     url = (url or "").strip()
-    if "drive.google.com/file/d/" in url:
-        file_id = url.split("/file/d/")[1].split("/")[0]
-        return f"https://drive.google.com/uc?export=download&id={file_id}"
+    if not url:
+        return url
+
+    try:
+        p = urlparse(url)
+        host = (p.netloc or "").lower()
+        path = p.path or ""
+        qs = parse_qs(p.query)
+
+        # https://drive.google.com/file/d/<ID>/view
+        if "drive.google.com" in host and "/file/d/" in path:
+            file_id = path.split("/file/d/")[1].split("/")[0]
+            if file_id:
+                return f"https://drive.google.com/uc?export=download&id={file_id}"
+
+        # https://drive.google.com/open?id=<ID>
+        if "drive.google.com" in host and path.rstrip("/") == "/open":
+            fid = (qs.get("id") or [None])[0]
+            if fid:
+                return f"https://drive.google.com/uc?export=download&id={fid}"
+
+        # https://drive.google.com/uc?...&id=<ID>
+        if "drive.google.com" in host and path.rstrip("/") == "/uc":
+            fid = (qs.get("id") or [None])[0]
+            if fid:
+                return f"https://drive.google.com/uc?export=download&id={fid}"
+
+        # https://drive.usercontent.google.com/download?id=<ID>&export=download
+        if host.endswith("drive.usercontent.google.com") and path.rstrip("/") == "/download":
+            fid = (qs.get("id") or [None])[0]
+            if fid:
+                return f"https://drive.google.com/uc?export=download&id={fid}"
+
+        # Some other googleusercontent download links still carry ?id=<ID>
+        if host.endswith("googleusercontent.com"):
+            fid = (qs.get("id") or [None])[0]
+            if fid:
+                return f"https://drive.google.com/uc?export=download&id={fid}"
+
+    except Exception:
+        return url
+
     return url
 
 
