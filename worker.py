@@ -19,8 +19,13 @@ from __future__ import annotations
 import os
 import time
 import traceback
+print("basic imports ok", flush=True)
+
 import logging
+print("logging ok", flush=True)
+
 from meta_ads_tool import MetaAPIError
+print("MetaAPIError ok", flush=True)
 
 from meta_ads_tool import (
     MetaConfig,
@@ -28,6 +33,7 @@ from meta_ads_tool import (
     build_queue_store,
     _drain_queue_group_v2,
 )
+print("meta_ads_tool ok", flush=True)
 
 
 def _get_int_env(*names: str, default: int) -> int:
@@ -46,13 +52,19 @@ GROUP_SCAN_LIMIT = _get_int_env("WORKER_GROUP_SCAN_LIMIT", default=50)
 
 
 def main() -> None:
+    print("main() called", flush=True)
     cfg = MetaConfig.from_env()
+    print("MetaConfig loaded", flush=True)
 
     store_path = (os.getenv("IDEMPOTENCY_DB_PATH") or ".meta_idempotency.db").strip() or ".meta_idempotency.db"
     store = build_idempotency_store(store_path)
+    print("idempotency store ok", flush=True)
 
     queue_db_path = (os.getenv("QUEUE_DB_PATH") or ".queue_state.db").strip() or ".queue_state.db"
     qstore = build_queue_store(queue_db_path)
+    print("queue store ok", flush=True)
+
+    print(f"Worker loop starting. POLL_S={POLL_S}", flush=True)
 
     while True:
         try:
