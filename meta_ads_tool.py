@@ -2311,8 +2311,8 @@ def apply_flexible_text_variants(plan: 'LaunchPlan') -> 'LaunchPlan':
             vobj: Dict[str, Any] = {"video_id": video_id}
             if thumb_hash:
                 vobj["thumbnail_hash"] = thumb_hash
-            elif thumb_url:
-                vobj["thumbnail_url"] = thumb_url
+            # Do NOT include thumbnail_url — CDN URLs expire before the worker runs.
+            # Meta will use its own generated thumbnail for the video.
             afs["videos"] = [vobj]
         elif image_hash:
             afs["ad_formats"] = ["SINGLE_IMAGE"]
