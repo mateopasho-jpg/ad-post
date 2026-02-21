@@ -1289,6 +1289,7 @@ class MetaClient:
             print("[DRY RUN] create_ad payload:", json.dumps(data, indent=2))
             return "DRY_RUN_AD_ID"
 
+        logging.warning("[create_ad] payload: %s", json.dumps(data, indent=2))
         payload = self._request("POST", f"/{acct}/ads", data=data)
         return payload["id"]
 
