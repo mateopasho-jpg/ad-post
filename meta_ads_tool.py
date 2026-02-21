@@ -2052,8 +2052,15 @@ def ensure_media_for_plan(client: 'MetaClient', cfg: MetaConfig, plan: 'LaunchPl
     if media_url:
         media_url = _normalize_drive_download_url(media_url)
 
-    if not media_type and media_url:
+    # Only do live network detection when NOT in dry_run mode.
+    # _detect_media_type() makes real HTTP requests (HEAD + GET) which add
+    # several seconds even before any upload — causing Make.com 40s timeouts.
+    if not media_type and media_url and not dry_run:
         media_type = _detect_media_type(media_url, timeout_s=min(20, int(cfg.timeout_s)))
+
+    # Zero-cost fallback: guess from URL extension (works in dry_run too)
+    if not media_type and media_url:
+        media_type = _guess_media_type_from_url(media_url)
 
     if not media_type:
         if a.video_path:
@@ -2070,6 +2077,7 @@ def ensure_media_for_plan(client: 'MetaClient', cfg: MetaConfig, plan: 'LaunchPl
             image_hash = "DRY_RUN_IMAGE_HASH" if dry_run else client.upload_image(image_path=a.image_path)
         elif media_url:
             if dry_run:
+                # Skip all network calls in dry_run — return placeholder immediately
                 image_hash = "DRY_RUN_IMAGE_HASH"
             else:
                 img_bytes, fname = _fetch_and_normalize_image_bytes(media_url, timeout_s=cfg.timeout_s)
@@ -2081,6 +2089,12 @@ def ensure_media_for_plan(client: 'MetaClient', cfg: MetaConfig, plan: 'LaunchPl
             a.media_url = None
             a.image_path = None
             inject_image_hash(plan, image_hash)
+        return plan
+
+    # For the v2 batching queue path (stable_for_queue=True), defer all slow
+    # network operations (image download+upload, video upload) to the drain/worker step.
+    # This keeps /run fast enough to respond within Make.com's 40s timeout.
+    if stable_for_queue and media_url and not (a.image_hash or a.video_id):
         return plan
 
     if media_type == "video" and stable_for_queue:
@@ -2994,34 +3008,9 @@ def _run_launch_plan_v2(
     # Collect queued items for this group.
     rows = qstore.fetch_group(product=plan.product, category=plan.category or "ug", signature=sig, limit=500)
 
-    # Helper: remove rows that already exist (idempotency) so they don't block batching.
-    def _is_row_already_launched(payload: dict) -> bool:
-        try:
-            p = LaunchPlan.model_validate(payload)
-        except Exception:
-            return False
-        base_name = p.creative.name
-        # Rebuild final names so launch_key is stable
-        vid, var, _ = parse_video_name_v2(base_name)
-        base = build_ad_base_name_v2(vid, var, p.product_label or "")
-        ad_name = build_ad_name_v2(base, p.offer_page or "")
-        launch_key_raw = f"{p.product}::{base}::{ad_name}".encode("utf-8")
-        launch_key = "launch:" + hashlib.sha256(launch_key_raw).hexdigest()[:24]
-        existing = store.get(launch_key)
-        if not existing:
-            return False
-        if dry_run:
-            return True
-        ad_id = existing.get("ad_id")
-        return bool(ad_id and is_meta_object_usable(client, str(ad_id)))
-
-    stale_ids: List[int] = []
-    for r in rows:
-        if _is_row_already_launched(r.payload):
-            stale_ids.append(r.id)
-    if stale_ids and not dry_run:
-        qstore.delete_ids(stale_ids)
-        rows = [r for r in rows if r.id not in set(stale_ids)]
+    # NOTE: Stale-row cleanup (checking if queued rows were already launched) is intentionally
+    # skipped here. Calling is_meta_object_usable() per row makes live Meta API calls (~3s each)
+    # which would blow Make.com's 40s timeout. Stale cleanup happens during drain/worker instead.
 
     policy = get_batch_policy()
 
