@@ -2343,24 +2343,6 @@ def apply_flexible_text_variants(plan: 'LaunchPlan') -> 'LaunchPlan':
         if ig_actor:
             clean_oss['instagram_actor_id'] = ig_actor
 
-        # For video creatives, Meta requires object_story_spec to contain video_data
-        # even when asset_feed_spec is used. Carry it over from the original oss.
-        if video_id and isinstance(oss, dict):
-            existing_vd = oss.get('video_data') or {}
-            vd: Dict[str, Any] = {'video_id': video_id}
-            if thumb_hash:
-                vd['thumbnail_hash'] = thumb_hash
-            elif thumb_url:
-                vd['image_url'] = thumb_url
-            elif existing_vd.get('image_hash'):
-                vd['thumbnail_hash'] = existing_vd['image_hash']
-            elif existing_vd.get('image_url'):
-                vd['image_url'] = existing_vd['image_url']
-            # call_to_action is required in video_data
-            if link_url:
-                vd['call_to_action'] = {'type': cta_type or 'LEARN_MORE', 'value': {'link': link_url}}
-            clean_oss['video_data'] = vd
-
         oss = clean_oss
 
     plan.creative.object_story_spec = oss
