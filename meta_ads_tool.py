@@ -843,14 +843,11 @@ class MetaClient:
                 self.cfg.access_token.encode("utf-8"),
                 hashlib.sha256,
             ).hexdigest()
-            if method.upper() == "GET":
+            # Inject the proof into query params (required for all request types)
+            params["appsecret_proof"] = proof
+            # For file uploads (multipart), token must go via query params too
+            if files is not None:
                 params.setdefault("access_token", self.cfg.access_token)
-            else:
-                # if we're uploading files (multipart), send token via query params
-                if files is not None:
-                    params.setdefault("access_token", self.cfg.access_token)
-                else:
-                    data.setdefault("access_token", self.cfg.access_token)
 
 
         last_err: Optional[Exception] = None
@@ -1228,14 +1225,15 @@ class MetaClient:
             enabled = bool(spec.is_adset_budget_sharing_enabled)
             data["is_adset_budget_sharing_enabled"] = "true" if enabled else "false"
 
-        if dry_run:
-            print("[DRY RUN] create_adset payload:", json.dumps(data, indent=2))
-            return "DRY_RUN_ADSET_ID"
+        # DSA transparency fields (EU accounts) - must be added before dry_run return
         if spec.dsa_beneficiary is not None:
             data["dsa_beneficiary"] = spec.dsa_beneficiary
         if spec.dsa_payor is not None:
             data["dsa_payor"] = spec.dsa_payor
 
+        if dry_run:
+            print("[DRY RUN] create_adset payload:", json.dumps(data, indent=2))
+            return "DRY_RUN_ADSET_ID"
 
         payload = self._request("POST", f"/{acct}/adsets", data=data)
         return payload["id"]
@@ -2308,6 +2306,18 @@ def apply_flexible_text_variants(plan: 'LaunchPlan') -> 'LaunchPlan':
                 "creative_features_spec": {"standard_enhancements": {"enroll_status": "OPT_IN"}}
             }
 
+        # IMPORTANT: When using asset_feed_spec for text variants, object_story_spec must be minimal and well-formed.
+        # Make.com often sends lists for link_data fields; Meta rejects those even if we also send asset_feed_spec.
+        # Keep only page_id (+ optional instagram actor/user id). Destination URL is provided via asset_feed_spec.link_urls.
+        page_id = oss.get('page_id') if isinstance(oss, dict) else None
+        ig_actor = oss.get('instagram_actor_id') if isinstance(oss, dict) else None
+        clean_oss: Dict[str, Any] = {}
+        if page_id:
+            clean_oss['page_id'] = page_id
+        if ig_actor:
+            clean_oss['instagram_actor_id'] = ig_actor
+        oss = clean_oss
+
     plan.creative.object_story_spec = oss
     return plan
 
@@ -2978,7 +2988,7 @@ def _run_launch_plan_v2(
         signature=sig,
         video_id=video_id,
         payload=plan.model_dump(),
-)
+    )
 
 
     # Collect queued items for this group.
@@ -3065,7 +3075,7 @@ def _run_launch_plan_v2(
 
     # Optional: if you run a dedicated worker on Railway, disable immediate draining
     # in the API service to avoid races / duplicate AdSet numbering.
-    immediate = (os.getenv("ENABLE_IMMEDIATE_DRAIN", "false") or "true").strip().lower() not in {"0", "false", "no"}
+    immediate = (os.getenv("ENABLE_IMMEDIATE_DRAIN", "true") or "true").strip().lower() not in {"0", "false", "no"}
     if not immediate:
         age_s = int((utcnow() - oldest_created_at).total_seconds())
         msg = (
