@@ -29,6 +29,7 @@ import dataclasses
 import hashlib
 import hmac
 import json
+import logging
 import os
 import sqlite3
 import sys
@@ -1257,6 +1258,7 @@ class MetaClient:
             print("[DRY RUN] create_adcreative payload:", json.dumps(data, indent=2))
             return "DRY_RUN_CREATIVE_ID"
 
+        logging.warning("[create_adcreative] payload: %s", json.dumps(data, indent=2))
         payload = self._request("POST", f"/{acct}/adcreatives", data=data)
         return payload["id"]
 
@@ -2082,6 +2084,8 @@ def ensure_media_for_plan(client: 'MetaClient', cfg: MetaConfig, plan: 'LaunchPl
             else:
                 img_bytes, fname = _fetch_and_normalize_image_bytes(media_url, timeout_s=cfg.timeout_s)
                 image_hash = client.upload_image(image_bytes=img_bytes, filename=fname)
+                if not image_hash:
+                    raise ValueError(f"Image upload to Meta returned no hash for URL: {media_url}")
 
         if image_hash:
             a.image_hash = image_hash
@@ -2089,6 +2093,12 @@ def ensure_media_for_plan(client: 'MetaClient', cfg: MetaConfig, plan: 'LaunchPl
             a.media_url = None
             a.image_path = None
             inject_image_hash(plan, image_hash)
+        elif not dry_run and not a.image_path:
+            raise ValueError(
+                f"No image_hash after media resolution. "
+                f"media_url={media_url!r} image_path={a.image_path!r}. "
+                f"The creative would be submitted without an image."
+            )
         return plan
 
     # For the v2 batching queue path (stable_for_queue=True), defer all slow
