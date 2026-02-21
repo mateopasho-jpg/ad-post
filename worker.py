@@ -19,6 +19,8 @@ from __future__ import annotations
 import os
 import time
 import traceback
+import logging
+from meta_ads_tool import MetaAPIError
 
 from meta_ads_tool import (
     MetaConfig,
@@ -65,6 +67,12 @@ def main() -> None:
                     signature=g["signature"],
                     dry_run=False,
                 )
+        except MetaAPIError as e:
+            if any(phrase in str(e).lower() for phrase in ("too many calls", "rate limit", "request limit")):
+                logging.warning("Rate limit hit, sleeping 60s before retry: %s", e)
+                time.sleep(60)
+            else:
+                traceback.print_exc()
         except Exception:
             traceback.print_exc()
 

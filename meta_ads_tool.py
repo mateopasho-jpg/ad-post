@@ -880,7 +880,9 @@ class MetaClient:
             except MetaAPIError as e:
                 # Retry only for transient-ish server errors/rate limits.
                 last_err = e
-                is_retryable = e.http_status in {500, 502, 503, 504, 429}
+                is_retryable = e.http_status in {500, 502, 503, 504, 429} or (
+                    e.http_status == 400 and "too many calls" in str(e).lower()
+                )
                 if attempt < max_retries and is_retryable:
                     time.sleep(1.5 * (attempt + 1))
                     continue
