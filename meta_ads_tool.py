@@ -2326,11 +2326,14 @@ def apply_flexible_text_variants(plan: 'LaunchPlan') -> 'LaunchPlan':
 
         plan.creative.asset_feed_spec = afs
 
-        # Opt-in to standard enhancements unless caller already set something.
-        if plan.creative.degrees_of_freedom_spec is None:
+        # Opt-in to standard enhancements for image creatives only.
+        # Meta rejects degrees_of_freedom_spec on video asset_feed_spec creatives.
+        if plan.creative.degrees_of_freedom_spec is None and not video_id:
             plan.creative.degrees_of_freedom_spec = {
                 "creative_features_spec": {"standard_enhancements": {"enroll_status": "OPT_IN"}}
             }
+        if video_id and plan.creative.degrees_of_freedom_spec is not None:
+            plan.creative.degrees_of_freedom_spec = None
 
         # IMPORTANT: When using asset_feed_spec for text variants, object_story_spec must be minimal and well-formed.
         # Make.com often sends lists for link_data fields; Meta rejects those even if we also send asset_feed_spec.
