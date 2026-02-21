@@ -1237,8 +1237,10 @@ class MetaClient:
         if dry_run:
             print("[DRY RUN] create_adset payload:", json.dumps(data, indent=2))
             return "DRY_RUN_ADSET_ID"
-
+        
+        logging.warning("[create_adset] payload: %s", json.dumps(data, indent=2))
         payload = self._request("POST", f"/{acct}/adsets", data=data)
+
         return payload["id"]
 
 
