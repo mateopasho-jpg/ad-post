@@ -2844,8 +2844,7 @@ def _drain_queue_group_v2(
                     continue
 
                 p = LaunchPlan.model_validate(r.payload)
-                # Capture list-valued text variants before any video conversion happens.
-                p = apply_flexible_text_variants(p)
+                # Resolve media first so video_id is available when building asset_feed_spec.
                 p = ensure_media_for_plan(client, cfg, p, dry_run=dry_run, stable_for_queue=False)
 
                 vid, var, _ = parse_video_name_v2(p.creative.name)
@@ -2854,7 +2853,7 @@ def _drain_queue_group_v2(
                 p.creative.url_tags = merge_url_tags(p.creative.url_tags)
                 p.ad.name = build_ad_name_v2(base_name, p.offer_page or "")
 
-                # Normalize list-valued text fields again (now we can attach media into asset_feed_spec)
+                # Build asset_feed_spec now that video_id is present.
                 p = apply_flexible_text_variants(p)
 
                 launch_key_raw = f"{p.product}::{p.creative.name}::{p.ad.name}".encode("utf-8")
