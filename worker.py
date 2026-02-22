@@ -19,13 +19,8 @@ from __future__ import annotations
 import os
 import time
 import traceback
-print("basic imports ok", flush=True)
-
 import logging
-print("logging ok", flush=True)
-
 from meta_ads_tool import MetaAPIError
-print("MetaAPIError ok", flush=True)
 
 from meta_ads_tool import (
     MetaConfig,
@@ -33,7 +28,6 @@ from meta_ads_tool import (
     build_queue_store,
     _drain_queue_group_v2,
 )
-print("meta_ads_tool ok", flush=True)
 
 
 def _get_int_env(*names: str, default: int) -> int:
@@ -47,29 +41,27 @@ def _get_int_env(*names: str, default: int) -> int:
     return int(default)
 
 
-POLL_S = _get_int_env("WORKER_POLL_SECONDS", "WORKER_POLL_S", default=10)
+POLL_S = _get_int_env("WORKER_POLL_SECONDS", "WORKER_POLL_S", default=120)  # 2 min between cycles
 GROUP_SCAN_LIMIT = _get_int_env("WORKER_GROUP_SCAN_LIMIT", default=50)
+GROUP_DELAY_S = _get_int_env("WORKER_GROUP_DELAY_SECONDS", default=15)  # pause between groups
 
 
 def main() -> None:
-    print("main() called", flush=True)
     cfg = MetaConfig.from_env()
-    print("MetaConfig loaded", flush=True)
 
     store_path = (os.getenv("IDEMPOTENCY_DB_PATH") or ".meta_idempotency.db").strip() or ".meta_idempotency.db"
     store = build_idempotency_store(store_path)
-    print("idempotency store ok", flush=True)
 
     queue_db_path = (os.getenv("QUEUE_DB_PATH") or ".queue_state.db").strip() or ".queue_state.db"
     qstore = build_queue_store(queue_db_path)
-    print("queue store ok", flush=True)
-
-    print(f"Worker loop starting. POLL_S={POLL_S}", flush=True)
 
     while True:
         try:
             groups = qstore.list_groups(limit=GROUP_SCAN_LIMIT)
-            for g in groups:
+            for i, g in enumerate(groups):
+                if i > 0:
+                    logging.info("Pausing %ds between groups to avoid rate limits...", GROUP_DELAY_S)
+                    time.sleep(GROUP_DELAY_S)
                 _drain_queue_group_v2(
                     cfg,
                     qstore=qstore,
@@ -80,11 +72,17 @@ def main() -> None:
                     dry_run=False,
                 )
         except MetaAPIError as e:
-            if any(phrase in str(e).lower() for phrase in ("too many calls", "rate limit", "request limit")):
-                logging.warning("Rate limit hit, sleeping 60s before retry: %s", e)
+            _emsg = str(e).lower()
+            _RATE_LIMIT_PHRASES = ("too many calls", "request limit", "application request limit", "rate limit")
+            _TRANSIENT_PHRASES = ("service temporarily unavailable", "temporarily unavailable", "unknown error", "please try again")
+            if any(p in _emsg for p in _RATE_LIMIT_PHRASES):
+                logging.warning("Rate limit hit, sleeping 60s: %s", e)
                 time.sleep(60)
+            elif any(p in _emsg for p in _TRANSIENT_PHRASES):
+                logging.warning("Transient Meta error, sleeping 30s: %s", e)
+                time.sleep(30)
             else:
-                traceback.print_exc()
+                logging.error("Meta API error (will retry next cycle): %s", e)
         except Exception:
             traceback.print_exc()
 

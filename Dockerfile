@@ -14,4 +14,6 @@ COPY . /app
 # Default port used by many platforms (Cloud Run sets $PORT)
 ENV PORT=8080
 
-#CMD ["bash", "-lc", "uvicorn api:app --host 0.0.0.0 --port ${PORT} --proxy-headers --timeout-keep-alive 75 --workers ${WEB_CONCURRENCY:-1}"]
+# Start command is set per-service in Railway:
+#   API service:    uvicorn api:app --host 0.0.0.0 --port $PORT --proxy-headers --timeout-keep-alive 75
+#   Worker service: python worker.py

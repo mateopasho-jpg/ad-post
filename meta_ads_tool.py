@@ -880,11 +880,23 @@ class MetaClient:
             except MetaAPIError as e:
                 # Retry only for transient-ish server errors/rate limits.
                 last_err = e
-                is_retryable = e.http_status in {500, 502, 503, 504, 429} or (
-                    e.http_status == 400 and "too many calls" in str(e).lower()
+                _msg_lower = str(e).lower()
+                _TRANSIENT_PHRASES = (
+                    "too many calls",
+                    "request limit",
+                    "application request limit",
+                    "rate limit",
+                    "service temporarily unavailable",
+                    "temporarily unavailable",
+                    "unknown error",
+                    "please try again",
+                )
+                is_retryable = (
+                    e.http_status in {429, 500, 502, 503, 504}
+                    or (e.http_status in {400, 403} and any(p in _msg_lower for p in _TRANSIENT_PHRASES))
                 )
                 if attempt < max_retries and is_retryable:
-                    time.sleep(1.5 * (attempt + 1))
+                    time.sleep(min(30, 3 * (attempt + 1)))  # 3s, 6s, 9s, 12s, 15s (max 30s)
                     continue
                 raise
             except requests.RequestException as e:
@@ -1090,7 +1102,7 @@ class MetaClient:
             data: Dict[str, Any] = {"file_url": file_url}
             if name:
                 data["name"] = name
-            payload = self._request("POST", f"/{acct}/advideos", data=data, use_video=True)
+            payload = self._request("POST", f"/{acct}/advideos", data=data, use_video=True, max_retries=5)
             video_id = str(payload.get("id") or "").strip()
             if not video_id:
                 raise MetaAPIError(f"Video upload did not return id. Response: {payload}")
@@ -1109,7 +1121,7 @@ class MetaClient:
             data: Dict[str, Any] = {}
             if name:
                 data["name"] = name
-            payload = self._request("POST", f"/{acct}/advideos", files=files, data=data, use_video=True)
+            payload = self._request("POST", f"/{acct}/advideos", files=files, data=data, use_video=True, max_retries=5)
             video_id = str(payload.get("id") or "").strip()
             if not video_id:
                 raise MetaAPIError(f"Video upload did not return id. Response: {payload}")
@@ -1237,10 +1249,8 @@ class MetaClient:
         if dry_run:
             print("[DRY RUN] create_adset payload:", json.dumps(data, indent=2))
             return "DRY_RUN_ADSET_ID"
-        
-        logging.warning("[create_adset] payload: %s", json.dumps(data, indent=2))
-        payload = self._request("POST", f"/{acct}/adsets", data=data)
 
+        payload = self._request("POST", f"/{acct}/adsets", data=data)
         return payload["id"]
 
 
@@ -1291,7 +1301,6 @@ class MetaClient:
             print("[DRY RUN] create_ad payload:", json.dumps(data, indent=2))
             return "DRY_RUN_AD_ID"
 
-        logging.warning("[create_ad] payload: %s", json.dumps(data, indent=2))
         payload = self._request("POST", f"/{acct}/ads", data=data)
         return payload["id"]
 
