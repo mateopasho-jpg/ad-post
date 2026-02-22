@@ -2315,7 +2315,11 @@ def apply_flexible_text_variants(plan: 'LaunchPlan') -> 'LaunchPlan':
         }
         if opts.primary_texts:
             # Meta rejects newlines in asset_feed_spec bodies — replace with a space.
-            afs["bodies"] = [{"text": t.replace("\n", " ").replace("\r", " ")} for t in opts.primary_texts]
+            def _clean_body(t: str) -> str:
+                import re as _re
+                t = t.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+                return _re.sub(r" {2,}", " ", t).strip()
+            afs["bodies"] = [{"text": _clean_body(t)} for t in opts.primary_texts]
         if opts.headlines:
             afs["titles"] = [{"text": t} for t in opts.headlines]
         if opts.descriptions:
@@ -2349,6 +2353,16 @@ def apply_flexible_text_variants(plan: 'LaunchPlan') -> 'LaunchPlan':
             }
         if video_id and plan.creative.degrees_of_freedom_spec is not None:
             plan.creative.degrees_of_freedom_spec = None
+
+        # CRITICAL: when asset_feed_spec is used, object_story_spec must be ONLY page_id.
+        # Meta rejects any creative that sends video_data/link_data alongside asset_feed_spec.
+        page_id = oss.get("page_id") if isinstance(oss, dict) else None
+        ig_actor = oss.get("instagram_actor_id") if isinstance(oss, dict) else None
+        oss = {}
+        if page_id:
+            oss["page_id"] = page_id
+        if ig_actor:
+            oss["instagram_actor_id"] = ig_actor
 
     plan.creative.object_story_spec = oss
     return plan
