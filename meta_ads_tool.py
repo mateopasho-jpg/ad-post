@@ -3020,6 +3020,12 @@ def _run_launch_plan_v2(
     sig = compute_adset_signature_v2(plan.adset)
     sig = f"{sig}:{(plan.audience or '').strip()}"
 
+    # ✅ Extract all text variants into text_options BEFORE media resolution flattens them.
+    # inject_video_id uses _first_text() which collapses list fields → single string when
+    # converting link_data → video_data. Saving to text_options here preserves all 3 variants
+    # across the queue so the drain worker can rebuild asset_feed_spec correctly.
+    plan = apply_flexible_text_variants(plan)
+
     # ✅ Resolve image_url/image_path -> image_hash BEFORE storing payload in queue
     plan = ensure_media_for_plan(client, cfg, plan, dry_run=dry_run, stable_for_queue=True)
 
