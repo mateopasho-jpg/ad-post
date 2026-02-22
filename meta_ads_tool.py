@@ -2352,6 +2352,17 @@ def apply_flexible_text_variants(plan: 'LaunchPlan') -> 'LaunchPlan':
         if video_id and plan.creative.degrees_of_freedom_spec is not None:
             plan.creative.degrees_of_freedom_spec = None
 
+        # IMPORTANT: when asset_feed_spec is used, object_story_spec must be stripped
+        # to just page_id. Meta rejects any creative that sends both video_data/link_data
+        # AND asset_feed_spec together.
+        page_id = oss.get("page_id") if isinstance(oss, dict) else None
+        ig_actor = oss.get("instagram_actor_id") if isinstance(oss, dict) else None
+        oss = {}
+        if page_id:
+            oss["page_id"] = page_id
+        if ig_actor:
+            oss["instagram_actor_id"] = ig_actor
+
     plan.creative.object_story_spec = oss
     return plan
 
