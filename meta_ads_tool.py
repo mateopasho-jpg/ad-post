@@ -2312,7 +2312,8 @@ def apply_flexible_text_variants(plan: 'LaunchPlan') -> 'LaunchPlan':
             "call_to_action_types": [cta_type or "LEARN_MORE"],
         }
         if opts.primary_texts:
-            afs["bodies"] = [{"text": t} for t in opts.primary_texts]
+            # Meta rejects newlines in asset_feed_spec bodies — replace with a space.
+            afs["bodies"] = [{"text": t.replace("\n", " ").replace("\r", " ")} for t in opts.primary_texts]
         if opts.headlines:
             afs["titles"] = [{"text": t} for t in opts.headlines]
         if opts.descriptions:
