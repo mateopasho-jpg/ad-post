@@ -2348,19 +2348,6 @@ def apply_flexible_text_variants(plan: 'LaunchPlan') -> 'LaunchPlan':
         if video_id and plan.creative.degrees_of_freedom_spec is not None:
             plan.creative.degrees_of_freedom_spec = None
 
-        # IMPORTANT: When using asset_feed_spec for text variants, object_story_spec must be minimal and well-formed.
-        # Make.com often sends lists for link_data fields; Meta rejects those even if we also send asset_feed_spec.
-        # Keep only page_id (+ optional instagram actor/user id). Destination URL is provided via asset_feed_spec.link_urls.
-        page_id = oss.get('page_id') if isinstance(oss, dict) else None
-        ig_actor = oss.get('instagram_actor_id') if isinstance(oss, dict) else None
-        clean_oss: Dict[str, Any] = {}
-        if page_id:
-            clean_oss['page_id'] = page_id
-        if ig_actor:
-            clean_oss['instagram_actor_id'] = ig_actor
-
-        oss = clean_oss
-
     plan.creative.object_story_spec = oss
     return plan
 
