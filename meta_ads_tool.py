@@ -871,6 +871,10 @@ class MetaClient:
                 if resp.status_code >= 400 or ("error" in payload):
                     error_obj = payload.get("error", {})
                     msg = error_obj.get("message") or payload.get("raw") or "Unknown Meta API error"
+                    # Include full error detail (subcode, user_msg, blame_field) to diagnose 400s
+                    extra = {k: v for k, v in error_obj.items() if k != "message"}
+                    if extra:
+                        msg = f"{msg} | detail: {json.dumps(extra)}"
                     raise MetaAPIError(
                         f"Meta API error ({resp.status_code}): {msg}",
                         http_status=resp.status_code,
@@ -2355,7 +2359,6 @@ def apply_flexible_text_variants(plan: 'LaunchPlan') -> 'LaunchPlan':
             plan.creative.degrees_of_freedom_spec = None
 
         # CRITICAL: when asset_feed_spec is used, object_story_spec must be ONLY page_id.
-        # Meta rejects any creative that sends video_data/link_data alongside asset_feed_spec.
         page_id = oss.get("page_id") if isinstance(oss, dict) else None
         ig_actor = oss.get("instagram_actor_id") if isinstance(oss, dict) else None
         oss = {}
