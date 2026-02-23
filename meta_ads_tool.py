@@ -1251,6 +1251,10 @@ class MetaClient:
         if spec.dynamic_creative:
             data["dynamic_creative"] = 1
 
+            # Some accounts/endpoints still require this flag as well.
+            # Send as "true" (string) for form-encoded API.
+            data["is_dynamic_creative"] = "true"
+
         # DSA transparency fields (EU accounts) - must be added before dry_run return
         if spec.dsa_beneficiary is not None:
             data["dsa_beneficiary"] = spec.dsa_beneficiary
@@ -2522,6 +2526,15 @@ def _run_launch_plan_v1(
         if not adset_id:
             adset_spec = plan.adset.model_copy(update={"name": adset_name})
             adset_id = client.create_adset(adset_spec, campaign_id=campaign_id, dry_run=False)
+
+# Sanity check: ensure Meta created a dynamic creative ad set.
+info = client.get_object(adset_id, fields="id,is_dynamic_creative,dynamic_creative")
+if adset_spec.dynamic_creative and not (info.get("is_dynamic_creative") or info.get("dynamic_creative")):
+    raise MetaAPIError(
+        "AdSet was created without dynamic creative enabled (Meta ignored flags).",
+        http_status=400,
+        error={"adset_id": adset_id, "adset_info": info},
+    )
             store.put_cached_adset_id(campaign_id, batch_id, bucket, adset_name, adset_id)
 
     # 4) Create creative (supports flexible text options)
@@ -2928,6 +2941,17 @@ def _drain_queue_group_v2(
                 adset_id = "DRY_RUN_ADSET_ID"
             else:
                 adset_id = client.create_adset(adset_spec, campaign_id=chosen_campaign_id, dry_run=False)
+
+# Sanity check: ensure Meta created a dynamic creative ad set.
+# If Meta ignores the DC flags, creating ads with asset_feed_spec creatives fails with:
+# "Cannot create dynamic creative ad in non-dynamic creative ad set"
+info = client.get_object(adset_id, fields="id,is_dynamic_creative,dynamic_creative")
+if not (info.get("is_dynamic_creative") or info.get("dynamic_creative")):
+    raise MetaAPIError(
+        "AdSet was created without dynamic creative enabled (Meta ignored flags).",
+        http_status=400,
+        error={"adset_id": adset_id, "adset_info": info},
+    )
 
             # 3) Create all ads referencing the creatives
             created_ads: List[str] = []
