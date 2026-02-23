@@ -2350,7 +2350,6 @@ def apply_flexible_text_variants(plan: 'LaunchPlan') -> 'LaunchPlan':
         plan.creative.asset_feed_spec = afs
 
         # Opt-in to standard enhancements for all creatives (image and video).
-        # Using flexible ads (not dynamic creative) so degrees_of_freedom_spec is valid for both.
         if plan.creative.degrees_of_freedom_spec is None:
             plan.creative.degrees_of_freedom_spec = {
                 "creative_features_spec": {"standard_enhancements": {"enroll_status": "OPT_IN"}}
