@@ -2309,8 +2309,11 @@ def apply_flexible_text_variants(plan: 'LaunchPlan') -> 'LaunchPlan':
     opts.descriptions = _dedupe(opts.descriptions)
     plan.creative.text_options = opts
 
-    # Build asset_feed_spec only if we have 2+ variants in any text field.
-    wants_multi = (len(opts.primary_texts) > 1) or (len(opts.headlines) > 1) or (len(opts.descriptions) > 1)
+    # Always build asset_feed_spec (even for single-text creatives) because the adset
+    # is always created as a dynamic creative adset in v2 batching. Meta requires ALL
+    # creatives in a dynamic adset to use asset_feed_spec — mixing regular and dynamic
+    # creatives in the same adset causes error 1885998.
+    wants_multi = (len(opts.primary_texts) >= 1) or (len(opts.headlines) >= 1) or (len(opts.descriptions) >= 1)
     if wants_multi:
         if not link_url:
             # Link URL required for flexible creatives.
