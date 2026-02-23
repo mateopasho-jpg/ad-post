@@ -17,6 +17,7 @@ Recommended env:
 from __future__ import annotations
 
 import os
+import sys
 import time
 import traceback
 import logging
@@ -47,6 +48,18 @@ GROUP_DELAY_S = _get_int_env("WORKER_GROUP_DELAY_SECONDS", default=15)  # pause 
 
 
 def main() -> None:
+    # ── Logging setup ──────────────────────────────────────────────────────────
+    # Force logs to stdout so Railway captures them in the service log panel.
+    # Without this, logging.warning/error calls produce NO output at all.
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s %(levelname)s %(message)s",
+        handlers=[logging.StreamHandler(sys.stdout)],
+        force=True,  # override any root-logger config set elsewhere
+    )
+    logging.info("Worker starting. POLL_S=%d GROUP_SCAN_LIMIT=%d GROUP_DELAY_S=%d",
+                 POLL_S, GROUP_SCAN_LIMIT, GROUP_DELAY_S)
+
     cfg = MetaConfig.from_env()
 
     store_path = (os.getenv("IDEMPOTENCY_DB_PATH") or ".meta_idempotency.db").strip() or ".meta_idempotency.db"
@@ -55,14 +68,21 @@ def main() -> None:
     queue_db_path = (os.getenv("QUEUE_DB_PATH") or ".queue_state.db").strip() or ".queue_state.db"
     qstore = build_queue_store(queue_db_path)
 
+    logging.info("Stores initialised. Entering poll loop...")
+
     while True:
         try:
             groups = qstore.list_groups(limit=GROUP_SCAN_LIMIT)
+            logging.info("Poll cycle: found %d group(s) in queue.", len(groups))
             for i, g in enumerate(groups):
+                logging.info(
+                    "Processing group %d/%d: product=%s category=%s signature=%s",
+                    i + 1, len(groups), g["product"], g["category"], g["signature"],
+                )
                 if i > 0:
                     logging.info("Pausing %ds between groups to avoid rate limits...", GROUP_DELAY_S)
                     time.sleep(GROUP_DELAY_S)
-                _drain_queue_group_v2(
+                result = _drain_queue_group_v2(
                     cfg,
                     qstore=qstore,
                     store=store,
@@ -71,6 +91,7 @@ def main() -> None:
                     signature=g["signature"],
                     dry_run=False,
                 )
+                logging.info("Group result: %s", result)
         except MetaAPIError as e:
             _emsg = str(e).lower()
             _RATE_LIMIT_PHRASES = ("too many calls", "request limit", "application request limit", "rate limit")
@@ -84,8 +105,9 @@ def main() -> None:
             else:
                 logging.error("Meta API error (will retry next cycle): %s", e)
         except Exception:
-            traceback.print_exc()
+            logging.error("Unexpected error in worker loop:\n%s", traceback.format_exc())
 
+        logging.info("Sleeping %ds until next poll...", POLL_S)
         time.sleep(POLL_S)
 
 

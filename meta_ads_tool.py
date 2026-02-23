@@ -513,6 +513,7 @@ class AdSetSpec(BaseModel):
 
     targeting: Dict[str, Any]
     promoted_object: Optional[Dict[str, Any]] = None
+    dynamic_creative: Optional[bool] = None
 
     @model_validator(mode="after")
     def _normalize_goal(self) -> "AdSetSpec":
@@ -1243,6 +1244,10 @@ class MetaClient:
         if using_adset_budget:
             enabled = bool(spec.is_adset_budget_sharing_enabled)
             data["is_adset_budget_sharing_enabled"] = "true" if enabled else "false"
+
+        # Dynamic creative adset - required when using asset_feed_spec creatives
+        if spec.dynamic_creative:
+            data["dynamic_creative"] = "true"
 
         # DSA transparency fields (EU accounts) - must be added before dry_run return
         if spec.dsa_beneficiary is not None:
@@ -2349,10 +2354,14 @@ def apply_flexible_text_variants(plan: 'LaunchPlan') -> 'LaunchPlan':
 
         plan.creative.asset_feed_spec = afs
 
-        # IMPORTANT: degrees_of_freedom_spec (standard_enhancements) is INCOMPATIBLE with
-        # asset_feed_spec. Meta API returns error 2446803 if both are sent together.
-        # When multi-text variants are used, we must NOT send degrees_of_freedom_spec.
-        plan.creative.degrees_of_freedom_spec = None
+        # Opt-in to standard enhancements for image creatives only.
+        # Meta rejects degrees_of_freedom_spec on video asset_feed_spec creatives.
+        if plan.creative.degrees_of_freedom_spec is None and not video_id:
+            plan.creative.degrees_of_freedom_spec = {
+                "creative_features_spec": {"standard_enhancements": {"enroll_status": "OPT_IN"}}
+            }
+        if video_id and plan.creative.degrees_of_freedom_spec is not None:
+            plan.creative.degrees_of_freedom_spec = None
 
         # CRITICAL: when asset_feed_spec is used, object_story_spec must be ONLY page_id.
         page_id = oss.get("page_id") if isinstance(oss, dict) else None
@@ -2828,13 +2837,16 @@ def _drain_queue_group_v2(
                 next_adset_number,
                 group_plan.product_label or "",
                 group_plan.product_code or "",
-                group_plan.audience or "",
+                " ".join((group_plan.audience or "").split()).strip(),
             )
             next_adset_number += 1
 
             first_plan = LaunchPlan.model_validate(selected[0].payload)
             adset_spec = first_plan.adset.model_copy(deep=True)
             adset_spec.name = adset_name
+            # v2 batching always uses asset_feed_spec (dynamic creative).
+            # Meta requires the adset to be created with dynamic_creative=True.
+            adset_spec.dynamic_creative = True
 
             reserved_set = set(int(i) for i in reserved_ids)
 
