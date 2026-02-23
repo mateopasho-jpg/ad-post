@@ -1198,7 +1198,7 @@ class MetaClient:
         return payload["id"]
 
 
-    def create_adset(self, spec: AdSetSpec, campaign_id: str, *, dry_run: bool = False, dynamic_creative: bool = False) -> str:
+    def create_adset(self, spec: AdSetSpec, campaign_id: str, *, dry_run: bool = False) -> str:
         acct = normalize_ad_account_id(self.cfg.ad_account_id)
 
         data: Dict[str, Any] = {
@@ -1249,9 +1249,6 @@ class MetaClient:
             data["dsa_beneficiary"] = spec.dsa_beneficiary
         if spec.dsa_payor is not None:
             data["dsa_payor"] = spec.dsa_payor
-
-        if dynamic_creative:
-            data["is_dynamic_creative"] = "true"
 
         if dry_run:
             print("[DRY RUN] create_adset payload:", json.dumps(data, indent=2))
@@ -2352,14 +2349,12 @@ def apply_flexible_text_variants(plan: 'LaunchPlan') -> 'LaunchPlan':
 
         plan.creative.asset_feed_spec = afs
 
-        # Opt-in to standard enhancements for image creatives only.
-        # Meta rejects degrees_of_freedom_spec on video asset_feed_spec creatives.
-        if plan.creative.degrees_of_freedom_spec is None and not video_id:
+        # Opt-in to standard enhancements for all creatives (image and video).
+        # Using flexible ads (not dynamic creative) so degrees_of_freedom_spec is valid for both.
+        if plan.creative.degrees_of_freedom_spec is None:
             plan.creative.degrees_of_freedom_spec = {
                 "creative_features_spec": {"standard_enhancements": {"enroll_status": "OPT_IN"}}
             }
-        if video_id and plan.creative.degrees_of_freedom_spec is not None:
-            plan.creative.degrees_of_freedom_spec = None
 
         # CRITICAL: when asset_feed_spec is used, object_story_spec must be ONLY page_id.
         page_id = oss.get("page_id") if isinstance(oss, dict) else None
@@ -2903,34 +2898,30 @@ def _drain_queue_group_v2(
                 # Not enough fresh items to form a full batch right now
                 continue
 
-            # Dynamic creative adsets only allow 1 ad each (Meta limit).
-            # So we create one adset + one ad per item, all under the same campaign.
-            created_ads: List[str] = []
+            # 1) Create all creatives first (no adset yet)
             created_creatives: List[str] = []
+            for item in prepared:
+                if dry_run:
+                    cid = "DRY_RUN_CREATIVE_ID"
+                else:
+                    cid = client.create_adcreative(item["plan"].creative, dry_run=False)
+                item["creative_id"] = cid
+                created_creatives.append(cid)
+
+            # 2) Create the adset
+            if dry_run:
+                adset_id = "DRY_RUN_ADSET_ID"
+            else:
+                adset_id = client.create_adset(adset_spec, campaign_id=chosen_campaign_id, dry_run=False)
+
+            # 3) Create all ads referencing the creatives
+            created_ads: List[str] = []
             per_ad_results: List[dict] = []
             processed_ids: List[int] = []
 
             for item in prepared:
                 p = item["plan"]
-
-                # 1) Create creative
-                if dry_run:
-                    cid = "DRY_RUN_CREATIVE_ID"
-                else:
-                    cid = client.create_adcreative(p.creative, dry_run=False)
-                item["creative_id"] = cid
-                created_creatives.append(cid)
-
-                # 2) Create a dedicated adset for this ad (1 ad per dynamic creative adset)
-                item_adset_spec = adset_spec.model_copy(deep=True)
-                item_adset_spec.name = adset_name
-                if dry_run:
-                    adset_id = "DRY_RUN_ADSET_ID"
-                else:
-                    adset_id = client.create_adset(item_adset_spec, campaign_id=chosen_campaign_id, dry_run=False, dynamic_creative=True)
-                item["adset_id"] = adset_id
-
-                # 3) Create the ad
+                cid = item["creative_id"]
                 if dry_run:
                     ad_id = "DRY_RUN_AD_ID"
                 else:
@@ -2957,7 +2948,7 @@ def _drain_queue_group_v2(
             created_batches.append(
                 {
                     "campaign_id": chosen_campaign_id,
-                    "adset_id": adset_id if prepared else None,
+                    "adset_id": adset_id,
                     "adset_name": adset_name,
                     "ads": per_ad_results,
                 }
