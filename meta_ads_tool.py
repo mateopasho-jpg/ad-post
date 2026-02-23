@@ -1198,7 +1198,7 @@ class MetaClient:
         return payload["id"]
 
 
-    def create_adset(self, spec: AdSetSpec, campaign_id: str, *, dry_run: bool = False) -> str:
+    def create_adset(self, spec: AdSetSpec, campaign_id: str, *, dry_run: bool = False, dynamic_creative: bool = False) -> str:
         acct = normalize_ad_account_id(self.cfg.ad_account_id)
 
         data: Dict[str, Any] = {
@@ -1249,6 +1249,9 @@ class MetaClient:
             data["dsa_beneficiary"] = spec.dsa_beneficiary
         if spec.dsa_payor is not None:
             data["dsa_payor"] = spec.dsa_payor
+
+        if dynamic_creative:
+            data["is_dynamic_creative"] = "true"
 
         if dry_run:
             print("[DRY RUN] create_adset payload:", json.dumps(data, indent=2))
