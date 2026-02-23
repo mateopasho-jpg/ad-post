@@ -2528,8 +2528,8 @@ def _run_launch_plan_v1(
             adset_id = client.create_adset(adset_spec, campaign_id=campaign_id, dry_run=False)
 
             # Sanity check: ensure Meta created a dynamic creative ad set.
-            info = client.get_object(adset_id, fields="id,is_dynamic_creative,dynamic_creative")
-            if adset_spec.dynamic_creative and not (info.get("is_dynamic_creative") or info.get("dynamic_creative")):
+            info = client.get_object(adset_id, fields="id,is_dynamic_creative")
+            if adset_spec.dynamic_creative and not (info.get("is_dynamic_creative") ):
                 raise MetaAPIError(
                     "AdSet was created without dynamic creative enabled (Meta ignored flags).",
                     http_status=400,
@@ -2946,8 +2946,8 @@ def _drain_queue_group_v2(
             # If Meta ignores the DC flags, creating ads with asset_feed_spec creatives fails with:
             # "Cannot create dynamic creative ad in non-dynamic creative ad set"
             if not dry_run:
-                info = client.get_object(adset_id, fields="id,is_dynamic_creative,dynamic_creative")
-                if adset_spec.dynamic_creative and not (info.get("is_dynamic_creative") or info.get("dynamic_creative")):
+                info = client.get_object(adset_id, fields="id,is_dynamic_creative")
+                if adset_spec.dynamic_creative and not (info.get("is_dynamic_creative") ):
                     raise MetaAPIError(
                         "AdSet was created without dynamic creative enabled (Meta ignored flags).",
                         http_status=400,
