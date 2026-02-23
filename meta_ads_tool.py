@@ -2349,11 +2349,10 @@ def apply_flexible_text_variants(plan: 'LaunchPlan') -> 'LaunchPlan':
 
         plan.creative.asset_feed_spec = afs
 
-        # Opt-in to standard enhancements for all creatives (image and video).
-        if plan.creative.degrees_of_freedom_spec is None:
-            plan.creative.degrees_of_freedom_spec = {
-                "creative_features_spec": {"standard_enhancements": {"enroll_status": "OPT_IN"}}
-            }
+        # IMPORTANT: degrees_of_freedom_spec (standard_enhancements) is INCOMPATIBLE with
+        # asset_feed_spec. Meta API returns error 2446803 if both are sent together.
+        # When multi-text variants are used, we must NOT send degrees_of_freedom_spec.
+        plan.creative.degrees_of_freedom_spec = None
 
         # CRITICAL: when asset_feed_spec is used, object_story_spec must be ONLY page_id.
         page_id = oss.get("page_id") if isinstance(oss, dict) else None
