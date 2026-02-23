@@ -60,6 +60,8 @@ import requests
 # IMPORTANT: "wait time" only works if something calls this service again
 # (or you run a worker that drains the queue periodically).
 
+ENABLE_ASSET_FEED_SPEC = os.getenv("ENABLE_ASSET_FEED_SPEC", "0").strip() == "1"
+
 @dataclass(frozen=True)
 class BatchPolicy:
     target: int = 4
@@ -513,7 +515,6 @@ class AdSetSpec(BaseModel):
 
     targeting: Dict[str, Any]
     promoted_object: Optional[Dict[str, Any]] = None
-    dynamic_creative: Optional[bool] = None
 
     @model_validator(mode="after")
     def _normalize_goal(self) -> "AdSetSpec":
@@ -1244,12 +1245,6 @@ class MetaClient:
         if using_adset_budget:
             enabled = bool(spec.is_adset_budget_sharing_enabled)
             data["is_adset_budget_sharing_enabled"] = "true" if enabled else "false"
-
-        # Dynamic creative adset - required when using asset_feed_spec creatives.
-        # Must be sent as integer 1 (not string "true" or bool True) for Meta's
-        # form-encoded API to accept it correctly.
-        if spec.dynamic_creative:
-            data["dynamic_creative"] = 1
 
         # DSA transparency fields (EU accounts) - must be added before dry_run return
         if spec.dsa_beneficiary is not None:
@@ -2311,11 +2306,11 @@ def apply_flexible_text_variants(plan: 'LaunchPlan') -> 'LaunchPlan':
     opts.descriptions = _dedupe(opts.descriptions)
     plan.creative.text_options = opts
 
-    # Always build asset_feed_spec (even for single-text creatives) because the adset
-    # is always created as a dynamic creative adset in v2 batching. Meta requires ALL
-    # creatives in a dynamic adset to use asset_feed_spec — mixing regular and dynamic
-    # creatives in the same adset causes error 1885998.
-    wants_multi = (len(opts.primary_texts) >= 1) or (len(opts.headlines) >= 1) or (len(opts.descriptions) >= 1)
+    # Build asset_feed_spec only if we have 2+ variants in any text field.
+    # Build asset_feed_spec only if explicitly enabled AND we have 2+ variants in any text field.
+    wants_multi = ENABLE_ASSET_FEED_SPEC and (
+        (len(opts.primary_texts) > 1) or (len(opts.headlines) > 1) or (len(opts.descriptions) > 1)
+    )
     if wants_multi:
         if not link_url:
             # Link URL required for flexible creatives.
@@ -2359,14 +2354,10 @@ def apply_flexible_text_variants(plan: 'LaunchPlan') -> 'LaunchPlan':
 
         plan.creative.asset_feed_spec = afs
 
-        # Opt-in to standard enhancements for image creatives only.
-        # Meta rejects degrees_of_freedom_spec on video asset_feed_spec creatives.
-        if plan.creative.degrees_of_freedom_spec is None and not video_id:
-            plan.creative.degrees_of_freedom_spec = {
-                "creative_features_spec": {"standard_enhancements": {"enroll_status": "OPT_IN"}}
-            }
-        if video_id and plan.creative.degrees_of_freedom_spec is not None:
-            plan.creative.degrees_of_freedom_spec = None
+        # IMPORTANT: degrees_of_freedom_spec (standard_enhancements) is INCOMPATIBLE with
+        # asset_feed_spec. Meta API returns error 2446803 if both are sent together.
+        # When multi-text variants are used, we must NOT send degrees_of_freedom_spec.
+        plan.creative.degrees_of_freedom_spec = None
 
         # CRITICAL: when asset_feed_spec is used, object_story_spec must be ONLY page_id.
         page_id = oss.get("page_id") if isinstance(oss, dict) else None
@@ -2842,16 +2833,13 @@ def _drain_queue_group_v2(
                 next_adset_number,
                 group_plan.product_label or "",
                 group_plan.product_code or "",
-                " ".join((group_plan.audience or "").split()).strip(),
+                group_plan.audience or "",
             )
             next_adset_number += 1
 
             first_plan = LaunchPlan.model_validate(selected[0].payload)
             adset_spec = first_plan.adset.model_copy(deep=True)
             adset_spec.name = adset_name
-            # v2 batching always uses asset_feed_spec (dynamic creative).
-            # Meta requires the adset to be created with dynamic_creative=True.
-            adset_spec.dynamic_creative = True
 
             reserved_set = set(int(i) for i in reserved_ids)
 
