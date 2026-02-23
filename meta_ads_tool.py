@@ -1245,9 +1245,11 @@ class MetaClient:
             enabled = bool(spec.is_adset_budget_sharing_enabled)
             data["is_adset_budget_sharing_enabled"] = "true" if enabled else "false"
 
-        # Dynamic creative adset - required when using asset_feed_spec creatives
+        # Dynamic creative adset - required when using asset_feed_spec creatives.
+        # Must be sent as integer 1 (not string "true" or bool True) for Meta's
+        # form-encoded API to accept it correctly.
         if spec.dynamic_creative:
-            data["dynamic_creative"] = "true"
+            data["dynamic_creative"] = 1
 
         # DSA transparency fields (EU accounts) - must be added before dry_run return
         if spec.dsa_beneficiary is not None:
