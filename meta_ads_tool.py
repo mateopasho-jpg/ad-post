@@ -2739,11 +2739,22 @@ def _drain_queue_group_v2(
         counts.sort(key=lambda x: x[1])
         chosen_campaign_id = counts[0][0]
 
-    # Determine next AdSet number (max across campaigns for this product)
+    # Determine next AdSet number (max across ALL products/campaigns globally)
     next_adset_number = 1
     if not dry_run:
         max_n = 0
-        for cid in campaign_ids:
+        # Collect campaign IDs from all products, not just the current one
+        all_campaign_ids: List[str] = list(campaign_ids)  # start with current product's campaigns
+        for other_product in {"green", "lila", "rosa"} - {product}:
+            other_slots = 2 if other_product in {"green", "lila"} else 1
+            other_ids_by_slot: Dict[int, str] = {}
+            if route_source == "db" and database_url:
+                other_ids_by_slot = get_campaign_ids(database_url, other_product)
+            for slot in range(1, other_slots + 1):
+                cid = other_ids_by_slot.get(slot)
+                if cid:
+                    all_campaign_ids.append(cid)
+        for cid in all_campaign_ids:
             try:
                 n = client.get_max_adset_prefix_number(cid, prefix_re=_ADSET_PREFIX_RE_V2)
                 if n > max_n:
