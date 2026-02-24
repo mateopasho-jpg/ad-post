@@ -2190,7 +2190,7 @@ def apply_flexible_text_variants(plan: 'LaunchPlan') -> 'LaunchPlan':
         return plan
 
     # ── Instagram actor mapping ───────────────────────────────────────────────
-    # Auto-inject instagram_actor_id based on page_id if not already set.
+    # Auto-inject instagram_user_id based on page_id if not already set.
     # Update these values once you have the real Instagram account IDs.
     _IG_ACTOR_MAP = {
         "498408976682598": "9151407794916420",   # angelika reichelt  <- replace 1 with real IG ID
@@ -2198,10 +2198,10 @@ def apply_flexible_text_variants(plan: 'LaunchPlan') -> 'LaunchPlan':
         "985534861302115": "",   # test           
     }
     _page_id = str(oss.get("page_id") or "")
-    if _page_id and not oss.get("instagram_actor_id"):
+    if _page_id and not oss.get("instagram_user_id"):
         _ig = _IG_ACTOR_MAP.get(_page_id)
         if _ig:
-            oss["instagram_actor_id"] = _ig
+            oss["instagram_user_id"] = _ig
             plan.creative.object_story_spec = oss
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -2385,7 +2385,7 @@ def apply_flexible_text_variants(plan: 'LaunchPlan') -> 'LaunchPlan':
 
         # CRITICAL: when asset_feed_spec is used, object_story_spec must be ONLY page_id.
         page_id = oss.get("page_id") if isinstance(oss, dict) else None
-        ig_actor = oss.get("instagram_actor_id") if isinstance(oss, dict) else None
+        ig_actor = oss.get("instagram_user_id") if isinstance(oss, dict) else None
 
         # ── Instagram actor mapping ───────────────────────────────────────────
         # Maps Facebook page_id -> Instagram account ID.
@@ -2403,7 +2403,7 @@ def apply_flexible_text_variants(plan: 'LaunchPlan') -> 'LaunchPlan':
         if page_id:
             oss["page_id"] = page_id
         if ig_actor:
-            oss["instagram_actor_id"] = ig_actor
+            oss["instagram_user_id"] = ig_actor
 
     plan.creative.object_story_spec = oss
     return plan
