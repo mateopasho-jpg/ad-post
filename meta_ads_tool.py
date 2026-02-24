@@ -1252,6 +1252,14 @@ class MetaClient:
         if spec.dsa_payor is not None:
             data["dsa_payor"] = spec.dsa_payor
 
+        # Always enable Website Events tracking (hardcoded)
+        data["destination_type"] = "WEBSITE"
+
+        # Always exclude PUR 180D audience (hardcoded)
+        # Meta now requires excluded_custom_audiences at adset level, not inside targeting
+        _PUR_180D_AUDIENCE_ID = "120214748301560430"
+        data["excluded_custom_audiences"] = json.dumps([{"id": _PUR_180D_AUDIENCE_ID}])
+
         if dry_run:
             print("[DRY RUN] create_adset payload:", json.dumps(data, indent=2))
             return "DRY_RUN_ADSET_ID"
@@ -2181,6 +2189,22 @@ def apply_flexible_text_variants(plan: 'LaunchPlan') -> 'LaunchPlan':
     if not isinstance(oss, dict):
         return plan
 
+    # ── Instagram actor mapping ───────────────────────────────────────────────
+    # Auto-inject instagram_actor_id based on page_id if not already set.
+    # Update these values once you have the real Instagram account IDs.
+    _IG_ACTOR_MAP = {
+        "498408976682598": "9151407794916420",   # angelika reichelt  <- replace 1 with real IG ID
+        "145003002023821": "2571697416291956",   # natur gesund check <- replace 2 with real IG ID
+        "985534861302115": "",   # test           
+    }
+    _page_id = str(oss.get("page_id") or "")
+    if _page_id and not oss.get("instagram_actor_id"):
+        _ig = _IG_ACTOR_MAP.get(_page_id)
+        if _ig:
+            oss["instagram_actor_id"] = _ig
+            plan.creative.object_story_spec = oss
+    # ─────────────────────────────────────────────────────────────────────────
+
     # Merge options from explicit text_options and any list-valued fields in object_story_spec.
     opts = plan.creative.text_options or CreativeTextOptions()
 
@@ -2362,6 +2386,19 @@ def apply_flexible_text_variants(plan: 'LaunchPlan') -> 'LaunchPlan':
         # CRITICAL: when asset_feed_spec is used, object_story_spec must be ONLY page_id.
         page_id = oss.get("page_id") if isinstance(oss, dict) else None
         ig_actor = oss.get("instagram_actor_id") if isinstance(oss, dict) else None
+
+        # ── Instagram actor mapping ───────────────────────────────────────────
+        # Maps Facebook page_id -> Instagram account ID.
+        # Update these values once you have the real Instagram account IDs.
+        _IG_ACTOR_MAP = {
+            "498408976682598": "9151407794916420",   # angelika reichelt  <- replace 1 with real IG ID
+            "145003002023821": "2571697416291956",   # natur gesund check <- replace 2 with real IG ID
+            "985534861302115": "",   # test               <- replace 3 with real IG ID
+        }
+        if page_id and not ig_actor:
+            ig_actor = _IG_ACTOR_MAP.get(str(page_id))
+        # ─────────────────────────────────────────────────────────────────────
+
         oss = {}
         if page_id:
             oss["page_id"] = page_id
@@ -2743,13 +2780,24 @@ def _drain_queue_group_v2(
     next_adset_number = 1
     if not dry_run:
         max_n = 0
-        # Collect campaign IDs from all products, not just the current one
-        all_campaign_ids: List[str] = list(campaign_ids)  # start with current product's campaigns
+        all_campaign_ids: List[str] = list(campaign_ids)
         for other_product in {"green", "lila", "rosa"} - {product}:
             other_slots = 2 if other_product in {"green", "lila"} else 1
             other_ids_by_slot: Dict[int, str] = {}
             if route_source == "db" and database_url:
                 other_ids_by_slot = get_campaign_ids(database_url, other_product)
+            else:
+                try:
+                    import sqlite3 as _sqlite3
+                    _db_path = (os.getenv("IDEMPOTENCY_DB_PATH") or ".meta_idempotency.db").strip() or ".meta_idempotency.db"
+                    with _sqlite3.connect(_db_path) as _conn:
+                        _rows = _conn.execute(
+                            "SELECT slot, campaign_id FROM product_campaign_routes_v2 WHERE product=? ORDER BY slot ASC",
+                            (other_product,),
+                        ).fetchall()
+                        other_ids_by_slot = {int(r[0]): str(r[1]) for r in _rows if r[1]}
+                except Exception:
+                    pass
             for slot in range(1, other_slots + 1):
                 cid = other_ids_by_slot.get(slot)
                 if cid:
@@ -2870,7 +2918,26 @@ def _drain_queue_group_v2(
                 base_name = build_ad_base_name_v2(vid, var, p.product_label or "")
                 p.creative.name = base_name
                 p.creative.url_tags = merge_url_tags(p.creative.url_tags)
-                p.ad.name = build_ad_name_v2(base_name, p.offer_page or "")
+                # Extract trailing number from link URL (e.g. 259 from "gh-2026-259/") and append to offer_page
+                _offer_page = p.offer_page or ""
+                try:
+                    _link = (p.creative.object_story_spec or {})
+                    if hasattr(_link, "link_data"):
+                        _url = (_link.link_data or {})
+                        _url = _url.link if hasattr(_url, "link") else ""
+                    else:
+                        _url = (_link.get("link_data") or {}).get("link") or ""
+                    if not _url and p.creative.object_story_spec:
+                        _oss = p.creative.object_story_spec
+                        _ld = getattr(_oss, "link_data", None) or {}
+                        _url = getattr(_ld, "link", None) or (isinstance(_ld, dict) and _ld.get("link")) or ""
+                    import re as _re
+                    _m = _re.search(r"-(\d{3,})\/?$", _url.rstrip("/"))
+                    if _m:
+                        _offer_page = f"{_offer_page} {_m.group(1)}"
+                except Exception:
+                    pass
+                p.ad.name = build_ad_name_v2(base_name, _offer_page)
 
                 # Build asset_feed_spec now that video_id is present.
                 p = apply_flexible_text_variants(p)
