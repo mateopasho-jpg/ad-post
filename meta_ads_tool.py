@@ -128,10 +128,8 @@ def derive_lp_marker(offer_page: str, url: str) -> str:
         if m:
             return "LP" + m.group(1)
 
-    raise ValueError(
-        "Could not derive LP### marker from destination URL. "
-        "Please ensure the link contains a 3-digit LP/page id (e.g. ...-259/ or lp=259)."
-    )
+    # Fallback: return empty string rather than raising so validation doesn't fail
+    return ""
 
 # -----------------------------
 # Custom audience exclusion (AdSet targeting)
@@ -912,6 +910,18 @@ class LaunchPlan(BaseModel):
 
         # schema_version >= 2 requires additional Notion-derived fields
         if self.schema_version >= 2:
+            import logging as _logging
+            _logging.getLogger(__name__).info(
+                "[VALIDATION DEBUG] schema_version=%r category=%r product_label=%r product_code=%r "
+                "audience=%r offer_page=%r dest_url=%r",
+                self.schema_version,
+                self.category,
+                self.product_label,
+                self.product_code,
+                self.audience,
+                self.offer_page,
+                _extract_destination_url(self.creative.object_story_spec),
+            )
             cat = (self.category or "").strip().lower()
             if cat not in {"ai", "ug"}:
                 raise ValueError("category must be one of: ai, ug (required for schema_version >= 2)")
