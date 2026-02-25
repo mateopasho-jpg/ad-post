@@ -1208,7 +1208,7 @@ class MetaClient:
             "campaign_id": campaign_id,
             "status": spec.status,
             "billing_event": spec.billing_event,
-            "optimization_goal": spec.optimization_goal,
+            "optimization_goal": "OFFSITE_CONVERSIONS",  # hardcoded: all campaigns are OUTCOME_SALES
             "targeting": json.dumps(spec.targeting),
         }
 
@@ -2193,9 +2193,9 @@ def apply_flexible_text_variants(plan: 'LaunchPlan') -> 'LaunchPlan':
     # Auto-inject instagram_user_id based on page_id if not already set.
     # Update these values once you have the real Instagram account IDs.
     _IG_ACTOR_MAP = {
-        "498408976682598": "17841472081334201",   # angelika reichelt
-        "145003002023821": "17841428880778978",   # natur gesund check
-        "985534861302115": "",                    # test
+        "498408976682598": "9151407794916420",   # angelika reichelt  <- replace 1 with real IG ID
+        "145003002023821": "2571697416291956",   # natur gesund check <- replace 2 with real IG ID
+        "985534861302115": "",   # test           
     }
     _page_id = str(oss.get("page_id") or "")
     if _page_id and not oss.get("instagram_user_id"):
@@ -2391,9 +2391,9 @@ def apply_flexible_text_variants(plan: 'LaunchPlan') -> 'LaunchPlan':
         # Maps Facebook page_id -> Instagram account ID.
         # Update these values once you have the real Instagram account IDs.
         _IG_ACTOR_MAP = {
-            "498408976682598": "17841472081334201",   # angelika reichelt
-            "145003002023821": "17841428880778978",   # natur gesund check
-            "985534861302115": "",                    # test
+            "498408976682598": "9151407794916420",   # angelika reichelt  <- replace 1 with real IG ID
+            "145003002023821": "2571697416291956",   # natur gesund check <- replace 2 with real IG ID
+            "985534861302115": "",   # test               <- replace 3 with real IG ID
         }
         if page_id and not ig_actor:
             ig_actor = _IG_ACTOR_MAP.get(str(page_id))
