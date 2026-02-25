@@ -42,6 +42,97 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Literal
 import re
 from urllib.parse import urlparse, parse_qs
+
+# -----------------------------
+# LP marker extraction (schema v2)
+# -----------------------------
+# We want a stable "LP###" marker derived from the creative destination URL.
+# Primary source: the URL found in creative.object_story_spec (link_data.link OR video_data.call_to_action.value.link).
+# Fallback: any provided offer_page field (e.g. "LP259" or a URL).
+#
+# This marker is used in names and for grouping, so it should be consistent.
+
+_LP_FROM_TEXT_RE = re.compile(r"(?:^|[^a-z0-9])lp[^0-9]*(\d{3,})", re.IGNORECASE)
+_LAST_3_DIGITS_RE = re.compile(r"(\d{3})(?!.*\d)")
+
+def _extract_destination_url(object_story_spec: Any) -> str:
+    """Best-effort destination URL extraction from Meta creative object_story_spec."""
+    oss = object_story_spec or {}
+    # Allow dict-like or object-like.
+    def _get(obj: Any, key: str, default: Any = None) -> Any:
+        if isinstance(obj, dict):
+            return obj.get(key, default)
+        return getattr(obj, key, default)
+
+    # 1) link_data.link (image/link style)
+    link_data = _get(oss, "link_data", None) or {}
+    link = _get(link_data, "link", "") or ""
+    if isinstance(link, str) and link.strip():
+        return link.strip()
+
+    # 2) video_data.call_to_action.value.link (video style after inject_video_id)
+    video_data = _get(oss, "video_data", None) or {}
+    cta = _get(video_data, "call_to_action", None) or {}
+    val = _get(cta, "value", None) or {}
+    link = _get(val, "link", "") or ""
+    if isinstance(link, str) and link.strip():
+        return link.strip()
+
+    # 3) Occasionally people put a URL in "offer_page" or another field; handled upstream by fallback.
+    return ""
+
+def derive_lp_marker(offer_page: str, url: str) -> str:
+    """Return 'LP###' derived from URL (preferred) or offer_page (fallback)."""
+    offer_page = (offer_page or "").strip()
+    url = (url or "").strip()
+
+    # Prefer URL parsing: check common patterns in path/query.
+    candidates: list[str] = []
+
+    if url:
+        try:
+            parsed = urlparse(url)
+            # Query parameters first (e.g. ?lp=259)
+            q = parse_qs(parsed.query or "")
+            for k in ("lp", "LP", "offer", "page"):
+                if k in q and q[k]:
+                    candidates.append(str(q[k][0]))
+            # Whole URL text patterns
+            candidates.append(url)
+            # Path tail (often "...-259/" or ".../259")
+            if parsed.path:
+                candidates.append(parsed.path.rstrip("/"))
+        except Exception:
+            candidates.append(url)
+
+    # Also consider provided offer_page (could be "LP259" or a URL)
+    if offer_page:
+        candidates.append(offer_page)
+
+    # 1) "LP..." pattern anywhere
+    for s in candidates:
+        m = _LP_FROM_TEXT_RE.search(s)
+        if m:
+            return "LP" + m.group(1)[-3:]
+
+    # 2) Trailing "-<digits>" in a path segment (e.g. "gh-2026-259")
+    for s in candidates:
+        s2 = (s or "").strip().rstrip("/")
+        m = re.search(r"-(\d{3,})$", s2)
+        if m:
+            return "LP" + m.group(1)[-3:]
+
+    # 3) Last 3 digits anywhere (fallback)
+    for s in candidates:
+        m = _LAST_3_DIGITS_RE.search(s or "")
+        if m:
+            return "LP" + m.group(1)
+
+    raise ValueError(
+        "Could not derive LP### marker from destination URL. "
+        "Please ensure the link contains a 3-digit LP/page id (e.g. ...-259/ or lp=259)."
+    )
+
 from token_store import get_valid_access_token
 import io
 from PIL import Image
@@ -738,11 +829,17 @@ class LaunchPlan(BaseModel):
                 raise ValueError("category must be one of: ai, ug (required for schema_version >= 2)")
             self.category = cat
 
-            for field_name in ("product_label", "product_code", "audience", "offer_page"):
+            for field_name in ("product_label", "product_code", "audience"):
                 val = getattr(self, field_name)
                 if not (val or "").strip():
                     raise ValueError(f"{field_name} is required for schema_version >= 2")
                 setattr(self, field_name, str(val).strip())
+
+
+            # Normalize offer_page into a stable LP### marker derived from the destination URL.
+            # We prefer the creative destination URL; offer_page is used only as a fallback.
+            _dest_url = _extract_destination_url(self.creative.object_story_spec)
+            self.offer_page = derive_lp_marker(self.offer_page or "", _dest_url)
 
             # Normalize countries: accept list or comma/space separated string
             countries = self.countries
@@ -1555,8 +1652,10 @@ def resolve_campaign_variants_v2(product: str) -> list[str]:
     }
     return defaults.get(product, ["TESTING"])
 
-def build_adset_name_v2(adset_number: int, product_label: str, product_code: str, audience: str) -> str:
-    return f"{adset_number} Test // VFB // #{product_code}# // {product_label} // {audience} // Batch"
+def build_adset_name_v2(adset_number: int, product_label: str, product_code: str, audience: str, offer_page: str) -> str:
+    offer_page = (offer_page or "").strip()
+    # Keep the prefix format stable: '<N> Test // ...' so numbering regex continues to work.
+    return f"{adset_number} Test // VFB // #{product_code}# // {product_label} // {audience} // Batch // {offer_page}"
 
 def build_ad_base_name_v2(video_id: str, variant: int, product_label: str) -> str:
     return f"{video_id}_{variant}_{product_label}"
@@ -2680,7 +2779,7 @@ def _drain_queue_group_v2(
         }
 
     group_plan = group_plans[0]
-    keyset = {(p.product_label, p.product_code, p.audience) for p in group_plans}
+    keyset = {(p.product_label, p.product_code, p.audience, p.offer_page) for p in group_plans}
     if len(keyset) > 1:
         return {
             "mode": "batch",
@@ -2895,6 +2994,7 @@ def _drain_queue_group_v2(
                 group_plan.product_label or "",
                 group_plan.product_code or "",
                 group_plan.audience or "",
+                group_plan.offer_page or "",
             )
             next_adset_number += 1
 
@@ -2920,26 +3020,8 @@ def _drain_queue_group_v2(
                 base_name = build_ad_base_name_v2(vid, var, p.product_label or "")
                 p.creative.name = base_name
                 p.creative.url_tags = merge_url_tags(p.creative.url_tags)
-                # Extract trailing number from link URL (e.g. 259 from "gh-2026-259/") and append to offer_page
-                _offer_page = p.offer_page or ""
-                try:
-                    _link = (p.creative.object_story_spec or {})
-                    if hasattr(_link, "link_data"):
-                        _url = (_link.link_data or {})
-                        _url = _url.link if hasattr(_url, "link") else ""
-                    else:
-                        _url = (_link.get("link_data") or {}).get("link") or ""
-                    if not _url and p.creative.object_story_spec:
-                        _oss = p.creative.object_story_spec
-                        _ld = getattr(_oss, "link_data", None) or {}
-                        _url = getattr(_ld, "link", None) or (isinstance(_ld, dict) and _ld.get("link")) or ""
-                    import re as _re
-                    _m = _re.search(r"-(\d{3,})\/?$", _url.rstrip("/"))
-                    if _m:
-                        _offer_page = f"{_offer_page} {_m.group(1)}"
-                except Exception:
-                    pass
-                p.ad.name = build_ad_name_v2(base_name, _offer_page)
+                # Build final Ad name (offer_page is normalized to LP### in LaunchPlan validator)
+                p.ad.name = build_ad_name_v2(base_name, p.offer_page or "")
 
                 # Build asset_feed_spec now that video_id is present.
                 p = apply_flexible_text_variants(p)
@@ -3106,7 +3188,7 @@ def _run_launch_plan_v2(
     video_id, variant, _label = parse_video_name_v2(plan.creative.name)
 
     sig = compute_adset_signature_v2(plan.adset)
-    sig = f"{sig}:{(plan.audience or '').strip()}"
+    sig = f"{sig}:{(plan.audience or '').strip()}:{(plan.offer_page or '').strip()}"
 
     # ✅ Extract all text variants into text_options BEFORE media resolution flattens them.
     # inject_video_id uses _first_text() which collapses list fields → single string when
