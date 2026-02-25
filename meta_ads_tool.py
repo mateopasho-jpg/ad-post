@@ -56,7 +56,11 @@ _LP_FROM_TEXT_RE = re.compile(r"(?:^|[^a-z0-9])lp[^0-9]*(\d{3,})", re.IGNORECASE
 _LAST_3_DIGITS_RE = re.compile(r"(\d{3})(?!.*\d)")
 
 def _extract_destination_url(object_story_spec: Any) -> str:
-    """Best-effort destination URL extraction from Meta creative object_story_spec."""
+    """Best-effort destination URL extraction from Meta creative object_story_spec.
+
+    Handles both string and list/tuple inputs for link fields (some webhook senders serialize
+    Meta 'link_data.link' as an array).
+    """
     oss = object_story_spec or {}
     # Allow dict-like or object-like.
     def _get(obj: Any, key: str, default: Any = None) -> Any:
@@ -64,19 +68,28 @@ def _extract_destination_url(object_story_spec: Any) -> str:
             return obj.get(key, default)
         return getattr(obj, key, default)
 
+    def _first_non_empty_str(val: Any) -> str:
+        if isinstance(val, str):
+            return val.strip()
+        if isinstance(val, (list, tuple)):
+            for item in val:
+                if isinstance(item, str) and item.strip():
+                    return item.strip()
+        return ""
+
     # 1) link_data.link (image/link style)
     link_data = _get(oss, "link_data", None) or {}
-    link = _get(link_data, "link", "") or ""
-    if isinstance(link, str) and link.strip():
-        return link.strip()
+    link = _first_non_empty_str(_get(link_data, "link", "") or "")
+    if link:
+        return link
 
     # 2) video_data.call_to_action.value.link (video style after inject_video_id)
     video_data = _get(oss, "video_data", None) or {}
     cta = _get(video_data, "call_to_action", None) or {}
     val = _get(cta, "value", None) or {}
-    link = _get(val, "link", "") or ""
-    if isinstance(link, str) and link.strip():
-        return link.strip()
+    link = _first_non_empty_str(_get(val, "link", "") or "")
+    if link:
+        return link
 
     # 3) Occasionally people put a URL in "offer_page" or another field; handled upstream by fallback.
     return ""
@@ -3286,7 +3299,7 @@ def _run_launch_plan_v2(
     video_id, variant, _label = parse_video_name_v2(plan.creative.name)
 
     sig = compute_adset_signature_v2(plan.adset)
-    sig = f"{sig}:{(plan.audience or '').strip()}:{(plan.offer_page or '').strip()}"
+    sig = f"{sig}:{(plan.audience or '').strip()}"
 
     # ✅ Extract all text variants into text_options BEFORE media resolution flattens them.
     # inject_video_id uses _first_text() which collapses list fields → single string when
