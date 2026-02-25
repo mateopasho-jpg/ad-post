@@ -1236,9 +1236,11 @@ class MetaClient:
         if spec.end_time is not None:
             data["end_time"] = spec.end_time
 
-        # Promoted object (optional)
-        if spec.promoted_object is not None:
-            data["promoted_object"] = json.dumps(spec.promoted_object)
+        # Promoted object - hardcoded for OUTCOME_SALES + OFFSITE_CONVERSIONS
+        data["promoted_object"] = json.dumps({
+            "pixel_id": "1069467584465713",
+            "custom_event_type": "PURCHASE"
+        })
 
         # ✅ REQUIRED field for your account when using adset budgets
         # Force send as "true"/"false" (string) for Graph form encoding.
