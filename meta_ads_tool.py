@@ -133,6 +133,94 @@ def derive_lp_marker(offer_page: str, url: str) -> str:
         "Please ensure the link contains a 3-digit LP/page id (e.g. ...-259/ or lp=259)."
     )
 
+# -----------------------------
+# Custom audience exclusion (AdSet targeting)
+# -----------------------------
+# Meta removed "detailed targeting exclusions" for most advertisers; the reliable way
+# to exclude people is via Custom Audience exclusions. In the Ads API, that field is
+# typically part of the AdSet targeting spec ("targeting.excluded_custom_audiences").
+#
+# Some accounts/environments also accept a top-level "excluded_custom_audiences" param
+# on AdSet create. To maximize compatibility, we set BOTH: inside targeting and at
+# the top-level.
+
+def _get_excluded_custom_audience_ids() -> List[str]:
+    """Return list of Custom Audience IDs to always exclude.
+
+    Priority order (env):
+      1) EXCLUDED_CUSTOM_AUDIENCE_IDS            (comma/space separated list)
+      2) PURCHASE_180D_AUDIENCE_IDS             (comma/space separated list; legacy naming you use in Railway)
+      3) PURCHASE_180D_AUDIENCE_ID              (single id; legacy naming you use in Railway)
+      4) PUR_180D_AUDIENCE_ID                   (single id; older legacy)
+    Falls back to the historical hardcoded PUR 180D audience ID.
+    """
+    raw = (
+        os.getenv("EXCLUDED_CUSTOM_AUDIENCE_IDS")
+        or os.getenv("PURCHASE_180D_AUDIENCE_IDS")
+        or os.getenv("PURCHASE_180D_AUDIENCE_ID")
+        or os.getenv("PUR_180D_AUDIENCE_ID")
+        or ""
+    ).strip()
+    if raw:
+        parts = [p for p in re.split(r"[,\s]+", raw) if p]
+        return parts
+    # Default (legacy): Purchasers 180D audience id used in your account
+    return ["120214748301560430"]
+
+
+def _coerce_custom_audience_ids(value: Any) -> List[str]:
+    """Normalize existing excluded_custom_audiences value into a list of ids."""
+    if value is None:
+        return []
+    # Sometimes people pass JSON strings
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return []
+        try:
+            parsed = json.loads(s)
+            return _coerce_custom_audience_ids(parsed)
+        except Exception:
+            # assume a single id string
+            return [s]
+
+    if isinstance(value, dict):
+        # {"id": "..."} or similar
+        if "id" in value and value["id"]:
+            return [str(value["id"]).strip()]
+        return []
+
+    if isinstance(value, list):
+        out: List[str] = []
+        for item in value:
+            out.extend(_coerce_custom_audience_ids(item))
+        return [x for x in out if x]
+
+    # unknown type, best effort
+    try:
+        s = str(value).strip()
+        return [s] if s else []
+    except Exception:
+        return []
+
+
+def _merge_excluded_custom_audiences(existing_value: Any, ids_to_add: List[str]) -> List[Dict[str, str]]:
+    """Merge existing excluded_custom_audiences with ids_to_add, deduping, preserving order."""
+    existing_ids = _coerce_custom_audience_ids(existing_value)
+    merged: List[str] = []
+    seen = set()
+
+    for x in existing_ids + (ids_to_add or []):
+        x = (str(x).strip() if x is not None else "")
+        if not x:
+            continue
+        if x in seen:
+            continue
+        seen.add(x)
+        merged.append(x)
+
+    return [{"id": x} for x in merged]
+
 from token_store import get_valid_access_token
 import io
 from PIL import Image
@@ -1300,13 +1388,25 @@ class MetaClient:
     def create_adset(self, spec: AdSetSpec, campaign_id: str, *, dry_run: bool = False) -> str:
         acct = normalize_ad_account_id(self.cfg.ad_account_id)
 
+        # Build targeting and inject global Custom Audience exclusions (e.g. PUR 180D).
+        # We set exclusions inside the targeting spec (recommended) and also send the
+        # top-level field for compatibility with some API/account behaviors.
+        targeting = dict(spec.targeting or {})
+        excluded_ids = _get_excluded_custom_audience_ids()
+        if excluded_ids:
+            targeting["excluded_custom_audiences"] = _merge_excluded_custom_audiences(
+                targeting.get("excluded_custom_audiences"),
+                excluded_ids,
+            )
+
+
         data: Dict[str, Any] = {
             "name": spec.name,
             "campaign_id": campaign_id,
             "status": spec.status,
             "billing_event": spec.billing_event,
             "optimization_goal": "OFFSITE_CONVERSIONS",  # hardcoded: all campaigns are OUTCOME_SALES
-            "targeting": json.dumps(spec.targeting),
+            "targeting": json.dumps(targeting),
         }
 
         # Budget
@@ -1354,10 +1454,9 @@ class MetaClient:
         # Always enable Website Events tracking (hardcoded)
         data["destination_type"] = "WEBSITE"
 
-        # Always exclude PUR 180D audience (hardcoded)
-        # Meta now requires excluded_custom_audiences at adset level, not inside targeting
-        _PUR_180D_AUDIENCE_ID = "120214748301560430"
-        data["excluded_custom_audiences"] = json.dumps([{"id": _PUR_180D_AUDIENCE_ID}])
+        # Always exclude configured Custom Audiences (e.g. Purchasers 180D).
+        if excluded_ids:
+            data["excluded_custom_audiences"] = json.dumps(targeting.get("excluded_custom_audiences", []))
 
         if dry_run:
             print("[DRY RUN] create_adset payload:", json.dumps(data, indent=2))
