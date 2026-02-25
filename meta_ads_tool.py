@@ -128,8 +128,10 @@ def derive_lp_marker(offer_page: str, url: str) -> str:
         if m:
             return "LP" + m.group(1)
 
-    # Fallback: return empty string rather than raising so validation doesn't fail
-    return ""
+    raise ValueError(
+        "Could not derive LP### marker from destination URL. "
+        "Please ensure the link contains a 3-digit LP/page id (e.g. ...-259/ or lp=259)."
+    )
 
 # -----------------------------
 # Custom audience exclusion (AdSet targeting)
@@ -910,18 +912,6 @@ class LaunchPlan(BaseModel):
 
         # schema_version >= 2 requires additional Notion-derived fields
         if self.schema_version >= 2:
-            import logging as _logging
-            _logging.getLogger(__name__).info(
-                "[VALIDATION DEBUG] schema_version=%r category=%r product_label=%r product_code=%r "
-                "audience=%r offer_page=%r dest_url=%r",
-                self.schema_version,
-                self.category,
-                self.product_label,
-                self.product_code,
-                self.audience,
-                self.offer_page,
-                _extract_destination_url(self.creative.object_story_spec),
-            )
             cat = (self.category or "").strip().lower()
             if cat not in {"ai", "ug"}:
                 raise ValueError("category must be one of: ai, ug (required for schema_version >= 2)")
@@ -1761,10 +1751,9 @@ def resolve_campaign_variants_v2(product: str) -> list[str]:
     }
     return defaults.get(product, ["TESTING"])
 
-def build_adset_name_v2(adset_number: int, product_label: str, product_code: str, audience: str, offer_page: str) -> str:
-    offer_page = (offer_page or "").strip()
-    # Keep the prefix format stable: '<N> Test // ...' so numbering regex continues to work.
-    return f"{adset_number} Test // VFB // #{product_code}# // {product_label} // {audience} // Batch // {offer_page}"
+def build_adset_name_v2(adset_number: int, product_label: str, product_code: str, audience: str, offer_page: str = "") -> str:
+    # LP marker is NOT included in adset name - only in ad name
+    return f"{adset_number} Test // VFB // #{product_code}# // {product_label} // {audience} // Batch"
 
 def build_ad_base_name_v2(video_id: str, variant: int, product_label: str) -> str:
     return f"{video_id}_{variant}_{product_label}"
@@ -2888,7 +2877,7 @@ def _drain_queue_group_v2(
         }
 
     group_plan = group_plans[0]
-    keyset = {(p.product_label, p.product_code, p.audience, p.offer_page) for p in group_plans}
+    keyset = {(p.product_label, p.product_code, p.audience) for p in group_plans}
     if len(keyset) > 1:
         return {
             "mode": "batch",
