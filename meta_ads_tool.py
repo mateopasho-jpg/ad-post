@@ -1216,19 +1216,54 @@ class MetaClient:
         return len(rows)
 
     def get_max_adset_prefix_number(self, campaign_id: str, *, prefix_re: re.Pattern, max_pages: int = 50) -> int:
-        """Parse AdSet name prefixes like '1028 Test // ...' and return max number."""
+        """Parse AdSet name prefixes like '1028 Test // ...' and return max number.
+        
+        Also handles legacy v1 format 'PRODUCT | batch_id | bucket' for awareness.
+        """
         rows = self.list_adsets_in_campaign(campaign_id, fields="name", limit=200, max_pages=max_pages)
         max_n = 0
+        
+        v2_matches = []
+        v1_adsets = []
+        unmatched = []
+        
+        # v1 legacy pattern: "ROSA | batch_123 | 01"
+        v1_pattern = re.compile(r"^[A-Z]+\s*\|\s*[^|]+\s*\|\s*(\d+)$")
+        
         for r in rows:
             name = (r.get("name") or "").strip()
+            if not name:
+                continue
+            
+            # Try v2 pattern first (current format: "1085 Test // ...")
             m = prefix_re.match(name)
             if m:
                 try:
                     n = int(m.group(1))
+                    v2_matches.append((name, n))
                     if n > max_n:
                         max_n = n
                 except Exception:
                     pass
+                continue
+            
+            # Check if it's v1 pattern (for logging purposes)
+            m_v1 = v1_pattern.match(name)
+            if m_v1:
+                v1_adsets.append(name)
+            else:
+                unmatched.append(name)
+        
+        # Log detailed breakdown
+        logging.info(f"Campaign {campaign_id}: found {len(rows)} total adsets")
+        if v2_matches:
+            logging.info(f"  - V2 adsets ({len(v2_matches)}): {v2_matches[:5]}{'...' if len(v2_matches) > 5 else ''}")
+        if v1_adsets:
+            logging.info(f"  - V1 legacy adsets ({len(v1_adsets)}): {v1_adsets[:3]}{'...' if len(v1_adsets) > 3 else ''}")
+        if unmatched:
+            logging.info(f"  - Unmatched adsets ({len(unmatched)}): {unmatched[:3]}{'...' if len(unmatched) > 3 else ''}")
+        logging.info(f"  - Max V2 number found: {max_n}")
+        
         return max_n
 
     # -----------------------------
@@ -2993,35 +3028,72 @@ def _drain_queue_group_v2(
     if not dry_run:
         max_n = 0
         all_campaign_ids: List[str] = list(campaign_ids)
-        for other_product in {"green", "lila", "rosa"} - {product}:
-            other_slots = 2 if other_product in {"green", "lila"} else 1
+        
+        # Fetch campaign IDs for ALL products (including current one if not already present)
+        for check_product in {"green", "lila", "rosa"}:
+            # Skip current product since we already have its IDs in campaign_ids
+            if check_product == product:
+                continue
+                
+            other_slots = 2 if check_product in {"green", "lila"} else 1
             other_ids_by_slot: Dict[int, str] = {}
+            
+            # Try database first if configured
             if route_source == "db" and database_url:
-                other_ids_by_slot = get_campaign_ids(database_url, other_product)
-            else:
+                try:
+                    other_ids_by_slot = get_campaign_ids(database_url, check_product)
+                    if other_ids_by_slot:
+                        logging.info(f"Fetched {check_product} campaigns from DB: {other_ids_by_slot}")
+                    else:
+                        logging.warning(f"DB returned empty dict for {check_product} campaigns")
+                except Exception as e:
+                    logging.warning(f"Could not fetch {check_product} campaigns from DB: {e}")
+            
+            # Fall back to local SQLite if DB source didn't work or returned empty
+            if not other_ids_by_slot:
                 try:
                     import sqlite3 as _sqlite3
                     _db_path = (os.getenv("IDEMPOTENCY_DB_PATH") or ".meta_idempotency.db").strip() or ".meta_idempotency.db"
                     with _sqlite3.connect(_db_path) as _conn:
                         _rows = _conn.execute(
                             "SELECT slot, campaign_id FROM product_campaign_routes_v2 WHERE product=? ORDER BY slot ASC",
-                            (other_product,),
+                            (check_product,),
                         ).fetchall()
                         other_ids_by_slot = {int(r[0]): str(r[1]) for r in _rows if r[1]}
-                except Exception:
-                    pass
+                    if other_ids_by_slot:
+                        logging.info(f"Fetched {check_product} campaigns from local SQLite: {other_ids_by_slot}")
+                    else:
+                        logging.warning(f"No {check_product} campaigns found in local SQLite DB at {_db_path}")
+                except Exception as e:
+                    logging.warning(f"Could not fetch {check_product} campaigns from local SQLite: {e}")
+            
+            # Add found campaign IDs to the list
+            if not other_ids_by_slot:
+                logging.warning(f"No campaign IDs found for {check_product} - this product will not contribute to max adset number calculation")
+            
             for slot in range(1, other_slots + 1):
                 cid = other_ids_by_slot.get(slot)
                 if cid:
-                    all_campaign_ids.append(cid)
+                    if cid not in all_campaign_ids:
+                        all_campaign_ids.append(cid)
+                        logging.info(f"Added {check_product} slot {slot} campaign {cid} to all_campaign_ids")
+                    else:
+                        logging.debug(f"Campaign {cid} already in all_campaign_ids, skipping")
+        
+        logging.info(f"Checking {len(all_campaign_ids)} campaign(s) for max adset number: {all_campaign_ids}")
+        
+        # Find max adset number across all campaigns
         for cid in all_campaign_ids:
             try:
                 n = client.get_max_adset_prefix_number(cid, prefix_re=_ADSET_PREFIX_RE_V2)
+                logging.info(f"Campaign {cid}: max adset number = {n}")
                 if n > max_n:
                     max_n = n
-            except Exception:
-                pass
+            except Exception as e:
+                logging.warning(f"Could not get max adset number for campaign {cid}: {e}")
+        
         next_adset_number = max_n + 1
+        logging.info(f"Next adset number for {product}: {next_adset_number} (max found: {max_n})")
 
     created_batches: List[dict] = []
 
