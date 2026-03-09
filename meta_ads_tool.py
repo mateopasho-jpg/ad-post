@@ -1318,6 +1318,91 @@ class MetaClient:
         return image_hash
 
 
+    def upload_video_resumable(
+        self,
+        *,
+        video_bytes: bytes,
+        filename: str = "video.mp4",
+        name: str | None = None,
+        ad_account_id: str | None = None,
+        chunk_size: int = 4 * 1024 * 1024,  # 4MB chunks
+    ) -> str:
+        """Upload large videos using resumable upload (for files > 100MB).
+        
+        Meta's resumable upload process:
+        1. Start upload session
+        2. Upload file in chunks
+        3. Finish upload session
+        """
+        acct = normalize_ad_account_id(ad_account_id or self.cfg.ad_account_id)
+        file_size = len(video_bytes)
+        
+        # Step 1: Initialize upload session
+        init_data = {
+            "upload_phase": "start",
+            "file_size": file_size,
+        }
+        if name:
+            init_data["name"] = name
+        
+        init_response = self._request(
+            "POST",
+            f"/{acct}/advideos",
+            data=init_data,
+            use_video=True,
+        )
+        
+        video_id = str(init_response.get("video_id") or "").strip()
+        upload_session_id = str(init_response.get("upload_session_id") or "").strip()
+        
+        if not video_id or not upload_session_id:
+            raise MetaAPIError(f"Failed to initialize upload session: {init_response}")
+        
+        logging.info(f"Initialized upload session for video {video_id} (size: {file_size} bytes)")
+        
+        # Step 2: Upload file in chunks
+        start_offset = 0
+        while start_offset < file_size:
+            end_offset = min(start_offset + chunk_size, file_size)
+            chunk = video_bytes[start_offset:end_offset]
+            
+            chunk_data = {
+                "upload_phase": "transfer",
+                "upload_session_id": upload_session_id,
+                "start_offset": start_offset,
+                "video_file_chunk": chunk,
+            }
+            
+            self._request(
+                "POST",
+                f"/{acct}/advideos",
+                data=chunk_data,
+                use_video=True,
+            )
+            
+            logging.info(f"Uploaded chunk {start_offset}-{end_offset} / {file_size}")
+            start_offset = end_offset
+        
+        # Step 3: Finalize upload
+        finish_data = {
+            "upload_phase": "finish",
+            "upload_session_id": upload_session_id,
+        }
+        
+        finish_response = self._request(
+            "POST",
+            f"/{acct}/advideos",
+            data=finish_data,
+            use_video=True,
+        )
+        
+        success = finish_response.get("success", False)
+        if not success:
+            raise MetaAPIError(f"Failed to finalize upload: {finish_response}")
+        
+        logging.info(f"Successfully uploaded video {video_id}")
+        return video_id
+
 
     def upload_video(
         self,
@@ -1341,6 +1426,7 @@ class MetaClient:
         Notes:
           - Uses graph-video domain for upload.
           - Optionally waits until encoding is ready.
+          - Automatically uses resumable upload for files > 100MB.
         """
         acct = normalize_ad_account_id(ad_account_id or self.cfg.ad_account_id)
 
@@ -1362,15 +1448,28 @@ class MetaClient:
                 video_bytes = p.read_bytes()
                 filename = p.name or filename
 
-            # Multipart upload; Meta expects 'source'
-            files = {"source": (filename, video_bytes, "video/mp4")}
-            data: Dict[str, Any] = {}
-            if name:
-                data["name"] = name
-            payload = self._request("POST", f"/{acct}/advideos", files=files, data=data, use_video=True, max_retries=5)
-            video_id = str(payload.get("id") or "").strip()
-            if not video_id:
-                raise MetaAPIError(f"Video upload did not return id. Response: {payload}")
+            # Check file size - use resumable upload for files > 100MB
+            file_size = len(video_bytes)
+            SIZE_THRESHOLD = 100 * 1024 * 1024  # 100MB
+            
+            if file_size > SIZE_THRESHOLD:
+                logging.info(f"Large video detected ({file_size} bytes), using resumable upload")
+                video_id = self.upload_video_resumable(
+                    video_bytes=video_bytes,
+                    filename=filename,
+                    name=name,
+                    ad_account_id=acct,
+                )
+            else:
+                # Multipart upload; Meta expects 'source'
+                files = {"source": (filename, video_bytes, "video/mp4")}
+                data: Dict[str, Any] = {}
+                if name:
+                    data["name"] = name
+                payload = self._request("POST", f"/{acct}/advideos", files=files, data=data, use_video=True, max_retries=5)
+                video_id = str(payload.get("id") or "").strip()
+                if not video_id:
+                    raise MetaAPIError(f"Video upload did not return id. Response: {payload}")
 
         if wait_for_ready:
             self.wait_for_video_ready(video_id, timeout_s=wait_timeout_s, poll_s=wait_poll_s)
