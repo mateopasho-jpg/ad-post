@@ -2916,6 +2916,7 @@ def apply_flexible_text_variants(plan: 'LaunchPlan') -> 'LaunchPlan':
     opts = plan.creative.text_options or CreativeTextOptions()
 
     def _coerce_str_list(v: Any) -> List[str]:
+        """Convert various formats to List[str], including Make.com nested format."""
         if v is None:
             return []
         if isinstance(v, str):
@@ -2924,9 +2925,16 @@ def apply_flexible_text_variants(plan: 'LaunchPlan') -> 'LaunchPlan':
         if isinstance(v, list):
             out: List[str] = []
             for x in v:
-                s = str(x).strip()
-                if s:
-                    out.append(s)
+                # Handle Make.com format: [{"value": "text"}, ...]
+                if isinstance(x, dict) and "value" in x:
+                    s = str(x["value"]).strip()
+                    if s:
+                        out.append(s)
+                # Handle plain strings in array
+                else:
+                    s = str(x).strip()
+                    if s:
+                        out.append(s)
             return out
         return []
 
@@ -4190,4 +4198,4 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main()) 
+    raise SystemExit(main())
