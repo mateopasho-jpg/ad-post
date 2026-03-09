@@ -3736,7 +3736,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    # Load env file
+    # Load env file...
     env_path = Path(args.env)
     if env_path.exists():
         load_dotenv(env_path, override=False)
@@ -3824,4 +3824,4 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main()) 
