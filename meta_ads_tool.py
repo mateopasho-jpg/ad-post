@@ -241,6 +241,11 @@ def _merge_excluded_custom_audiences(existing_value: Any, ids_to_add: List[str])
 
     return [{"id": x} for x in merged]
 
+
+def _get_advantage_audience_default() -> int:
+    raw = (os.getenv("META_ADVANTAGE_AUDIENCE_DEFAULT", "0") or "0").strip().lower()
+    return 1 if raw in {"1", "true", "yes", "on"} else 0
+
 from token_store import get_valid_access_token
 import io
 from PIL import Image
@@ -413,7 +418,7 @@ class MetaAPIError(RuntimeError):
 class MetaConfig:
     access_token: str
     ad_account_id: str
-    api_version: str = "v21.0"
+    api_version: str = "v25.0"
     app_id: str | None = None
     app_secret: str | None = None
     timeout_s: int = 30
@@ -424,7 +429,7 @@ class MetaConfig:
         load_dotenv(override=False)
 
         account_id = os.getenv("META_AD_ACCOUNT_ID", "").strip()
-        api_version = os.getenv("META_API_VERSION", "v21.0").strip() or "v21.0"
+        api_version = os.getenv("META_API_VERSION", "v25.0").strip() or "v25.0"
         app_id = os.getenv("META_APP_ID", "").strip() or None
         app_secret = os.getenv("META_APP_SECRET", "").strip() or None
 
@@ -781,6 +786,10 @@ class CreativeSpec(BaseModel):
 
     # Internal (built by backend when text_options / list fields exist)
     asset_feed_spec: Optional[Dict[str, Any]] = None
+
+    # Optional carousel card inputs. When present, the backend writes them into
+    # object_story_spec.link_data.child_attachments.
+    carousel_cards: Optional[List[Dict[str, Any]]] = None
 
     @field_validator("name", mode="before")
     @classmethod
@@ -1325,88 +1334,109 @@ class MetaClient:
         filename: str = "video.mp4",
         name: str | None = None,
         ad_account_id: str | None = None,
-        chunk_size: int = 4 * 1024 * 1024,  # 4MB chunks
+        chunk_size: int = 4 * 1024 * 1024,
     ) -> str:
-        """Upload large videos using resumable upload (for files > 100MB).
+        """Upload large videos using Meta's resumable upload (for files > 100MB).
         
-        Meta's resumable upload process:
-        1. Start upload session
-        2. Upload file in chunks
-        3. Finish upload session
+        Uses Meta's offset tracking from responses for reliable chunked upload.
         """
         acct = normalize_ad_account_id(ad_account_id or self.cfg.ad_account_id)
         file_size = len(video_bytes)
-        
-        # Step 1: Initialize upload session
-        init_data = {
+
+        init_data: Dict[str, Any] = {
             "upload_phase": "start",
-            "file_size": file_size,
+            "file_size": str(file_size),
         }
         if name:
             init_data["name"] = name
-        
+
         init_response = self._request(
             "POST",
             f"/{acct}/advideos",
             data=init_data,
             use_video=True,
+            max_retries=5,
         )
-        
+
         video_id = str(init_response.get("video_id") or "").strip()
         upload_session_id = str(init_response.get("upload_session_id") or "").strip()
-        
+        start_offset = str(init_response.get("start_offset") or "0").strip() or "0"
+        end_offset = str(init_response.get("end_offset") or "").strip()
+
         if not video_id or not upload_session_id:
             raise MetaAPIError(f"Failed to initialize upload session: {init_response}")
-        
-        logging.info(f"Initialized upload session for video {video_id} (size: {file_size} bytes)")
-        
-        # Step 2: Upload file in chunks
-        start_offset = 0
-        while start_offset < file_size:
-            end_offset = min(start_offset + chunk_size, file_size)
-            chunk = video_bytes[start_offset:end_offset]
-            
-            # Chunks must be sent as multipart form data
+
+        if not end_offset:
+            end_offset = str(min(int(start_offset) + int(chunk_size), file_size))
+
+        logging.info(f"Initialized resumable upload for video {video_id} (size: {file_size} bytes)")
+
+        while int(start_offset) < file_size:
+            start_i = int(start_offset)
+            end_i = int(end_offset) if end_offset else min(start_i + int(chunk_size), file_size)
+            end_i = max(start_i, min(end_i, file_size))
+            if start_i == end_i:
+                break
+
+            chunk = video_bytes[start_i:end_i]
             chunk_data = {
                 "upload_phase": "transfer",
                 "upload_session_id": upload_session_id,
                 "start_offset": start_offset,
             }
-            
             chunk_files = {
-                "video_file_chunk": (f"chunk_{start_offset}", chunk, "application/octet-stream")
+                "video_file_chunk": (f"chunk_{start_i}", chunk, "application/octet-stream")
             }
-            
-            self._request(
+
+            transfer_response = self._request(
                 "POST",
                 f"/{acct}/advideos",
                 data=chunk_data,
                 files=chunk_files,
                 use_video=True,
+                max_retries=5,
             )
-            
-            logging.info(f"Uploaded chunk {start_offset}-{end_offset} / {file_size}")
-            start_offset = end_offset
-        
-        # Step 3: Finalize upload
-        finish_data = {
+
+            next_start = str(transfer_response.get("start_offset") or "").strip()
+            next_end = str(transfer_response.get("end_offset") or "").strip()
+            logging.info(f"Uploaded chunk {start_i}-{end_i} / {file_size}")
+
+            if not next_start:
+                if end_i >= file_size:
+                    start_offset = str(file_size)
+                    end_offset = str(file_size)
+                    break
+                raise MetaAPIError(f"Resumable upload did not return next offsets: {transfer_response}")
+
+            if next_start == start_offset and next_end == end_offset:
+                raise MetaAPIError(f"Resumable upload stalled at offset {start_offset}: {transfer_response}")
+
+            start_offset = next_start
+            end_offset = next_end or str(min(int(start_offset) + int(chunk_size), file_size))
+
+        finish_data: Dict[str, Any] = {
             "upload_phase": "finish",
             "upload_session_id": upload_session_id,
         }
-        
+        if video_id:
+            finish_data["video_id"] = video_id
+        if name:
+            finish_data["name"] = name
+
         finish_response = self._request(
             "POST",
             f"/{acct}/advideos",
             data=finish_data,
             use_video=True,
+            max_retries=5,
         )
-        
+
         success = finish_response.get("success", False)
-        if not success:
+        if success is False and not finish_response.get("id") and not finish_response.get("video_id"):
             raise MetaAPIError(f"Failed to finalize upload: {finish_response}")
-        
+
         logging.info(f"Successfully uploaded video {video_id}")
-        return video_id
+        return str(finish_response.get("video_id") or finish_response.get("id") or video_id).strip()
 
 
     def upload_video(
@@ -1424,97 +1454,86 @@ class MetaClient:
     ) -> str:
         """Upload a video and return the AdVideo id.
 
-        Supported inputs:
-          - file_url: remote URL to a video file (preferred for Make/Notion)
-          - video_path / video_bytes: local upload (dev/testing)
-
-        Notes:
-          - Uses graph-video domain for upload.
-          - Optionally waits until encoding is ready.
-          - Automatically uses resumable upload for files > 100MB.
-          - For Google Drive URLs >100MB, downloads first then uses chunked upload.
+        Automatically downloads Google Drive videos and uses resumable upload for >100MB.
+        For other URLs, tries file_url first, falls back to download on failure.
         """
         acct = normalize_ad_account_id(ad_account_id or self.cfg.ad_account_id)
+        size_threshold = 100 * 1024 * 1024
 
         if file_url:
-            # Check if this is a Google Drive URL - we may need to download it for chunked upload
-            is_drive_url = "drive.google.com" in file_url or "drive.usercontent.google.com" in file_url
-            
-            if is_drive_url:
-                # HEAD request to check file size before deciding upload method
-                try:
-                    normalized_url = _normalize_drive_download_url(file_url)
-                    
-                    import requests
-                    head_resp = requests.head(normalized_url, allow_redirects=True, timeout=30)
-                    content_length = head_resp.headers.get('Content-Length')
-                    
-                    if content_length:
-                        file_size = int(content_length)
-                        SIZE_THRESHOLD = 100 * 1024 * 1024  # 100MB
-                        
-                        if file_size > SIZE_THRESHOLD:
-                            # Download the video and use chunked upload
-                            logging.info(f"Large Google Drive video detected ({file_size} bytes), downloading for chunked upload")
-                            get_resp = requests.get(normalized_url, timeout=600)  # 10 min timeout for large files
-                            get_resp.raise_for_status()
-                            video_bytes = get_resp.content
-                            
-                            video_id = self.upload_video_resumable(
-                                video_bytes=video_bytes,
-                                filename=filename,
-                                name=name,
-                                ad_account_id=acct,
-                            )
-                            
-                            if wait_for_ready:
-                                self.wait_for_video_ready(video_id, timeout_s=wait_timeout_s, poll_s=wait_poll_s)
-                            
-                            return video_id
-                except Exception as e:
-                    # If size check fails, fall back to simple URL upload
-                    logging.warning(f"Could not check Google Drive file size, falling back to simple upload: {e}")
-            
-            # Simple URL upload for non-Drive URLs or small files
-            data: Dict[str, Any] = {"file_url": file_url}
-            if name:
-                data["name"] = name
-            payload = self._request("POST", f"/{acct}/advideos", data=data, use_video=True, max_retries=5)
-            video_id = str(payload.get("id") or "").strip()
-            if not video_id:
-                raise MetaAPIError(f"Video upload did not return id. Response: {payload}")
-        else:
-            if video_bytes is None:
-                if not video_path:
-                    raise ValueError("Provide file_url, video_path, or video_bytes.")
-                p = Path(video_path)
-                if not p.exists():
-                    raise FileNotFoundError(f"Video file not found: {p}")
-                video_bytes = p.read_bytes()
-                filename = p.name or filename
+            normalized_url = _normalize_drive_download_url(file_url)
+            is_drive_url = ("drive.google.com" in normalized_url) or ("drive.usercontent.google.com" in normalized_url)
 
-            # Check file size - use resumable upload for files > 100MB
-            file_size = len(video_bytes)
-            SIZE_THRESHOLD = 100 * 1024 * 1024  # 100MB
-            
-            if file_size > SIZE_THRESHOLD:
-                logging.info(f"Large video detected ({file_size} bytes), using resumable upload")
-                video_id = self.upload_video_resumable(
-                    video_bytes=video_bytes,
-                    filename=filename,
+            if is_drive_url:
+                logging.info("Downloading Google Drive video and uploading directly to Meta")
+                remote_bytes, remote_filename = _fetch_remote_video_bytes(
+                    normalized_url,
+                    timeout_s=max(int(wait_timeout_s), int(self.cfg.timeout_s), 600),
+                )
+                return self.upload_video(
+                    video_bytes=remote_bytes,
+                    filename=remote_filename or filename,
                     name=name,
                     ad_account_id=acct,
+                    wait_for_ready=wait_for_ready,
+                    wait_timeout_s=wait_timeout_s,
+                    wait_poll_s=wait_poll_s,
                 )
-            else:
-                # Multipart upload; Meta expects 'source'
-                files = {"source": (filename, video_bytes, "video/mp4")}
-                data: Dict[str, Any] = {}
+
+            try:
+                data: Dict[str, Any] = {"file_url": normalized_url}
                 if name:
                     data["name"] = name
-                payload = self._request("POST", f"/{acct}/advideos", files=files, data=data, use_video=True, max_retries=5)
-                video_id = str(payload.get("id") or "").strip()
+                payload = self._request("POST", f"/{acct}/advideos", data=data, use_video=True, max_retries=5)
+                video_id = str(payload.get("id") or payload.get("video_id") or "").strip()
                 if not video_id:
                     raise MetaAPIError(f"Video upload did not return id. Response: {payload}")
+                if wait_for_ready:
+                    self.wait_for_video_ready(video_id, timeout_s=wait_timeout_s, poll_s=wait_poll_s)
+                return video_id
+            except Exception as e:
+                logging.warning(f"Remote video upload via file_url failed, falling back to direct upload: {e}")
+                remote_bytes, remote_filename = _fetch_remote_video_bytes(
+                    normalized_url,
+                    timeout_s=max(int(wait_timeout_s), int(self.cfg.timeout_s), 600),
+                )
+                return self.upload_video(
+                    video_bytes=remote_bytes,
+                    filename=remote_filename or filename,
+                    name=name,
+                    ad_account_id=acct,
+                    wait_for_ready=wait_for_ready,
+                    wait_timeout_s=wait_timeout_s,
+                    wait_poll_s=wait_poll_s,
+                )
+
+        if video_bytes is None:
+            if not video_path:
+                raise ValueError("Provide file_url, video_path, or video_bytes.")
+            p = Path(video_path)
+            if not p.exists():
+                raise FileNotFoundError(f"Video file not found: {p}")
+            video_bytes = p.read_bytes()
+            filename = p.name or filename
+
+        file_size = len(video_bytes)
+        if file_size > size_threshold:
+            logging.info(f"Large video detected ({file_size} bytes), using resumable upload")
+            video_id = self.upload_video_resumable(
+                video_bytes=video_bytes,
+                filename=filename,
+                name=name,
+                ad_account_id=acct,
+            )
+        else:
+            files = {"source": (filename, video_bytes, "video/mp4")}
+            data: Dict[str, Any] = {}
+            if name:
+                data["name"] = name
+            payload = self._request("POST", f"/{acct}/advideos", files=files, data=data, use_video=True, max_retries=5)
+            video_id = str(payload.get("id") or payload.get("video_id") or "").strip()
+            if not video_id:
+                raise MetaAPIError(f"Video upload did not return id. Response: {payload}")
 
         if wait_for_ready:
             self.wait_for_video_ready(video_id, timeout_s=wait_timeout_s, poll_s=wait_poll_s)
@@ -1587,9 +1606,6 @@ class MetaClient:
     def create_adset(self, spec: AdSetSpec, campaign_id: str, *, dry_run: bool = False) -> str:
         acct = normalize_ad_account_id(self.cfg.ad_account_id)
 
-        # Build targeting and inject global Custom Audience exclusions (e.g. PUR 180D).
-        # We set exclusions inside the targeting spec (recommended) and also send the
-        # top-level field for compatibility with some API/account behaviors.
         targeting = dict(spec.targeting or {})
         excluded_ids = _get_excluded_custom_audience_ids()
         if excluded_ids:
@@ -1598,17 +1614,24 @@ class MetaClient:
                 excluded_ids,
             )
 
+        targeting_automation = targeting.get("targeting_automation")
+        if not isinstance(targeting_automation, dict):
+            targeting_automation = {}
+        if targeting_automation.get("advantage_audience") in (None, ""):
+            targeting_automation["advantage_audience"] = _get_advantage_audience_default()
+        targeting["targeting_automation"] = targeting_automation
+
+        optimization_goal = (spec.optimization_goal or "").strip()
 
         data: Dict[str, Any] = {
             "name": spec.name,
             "campaign_id": campaign_id,
             "status": spec.status,
             "billing_event": spec.billing_event,
-            "optimization_goal": "OFFSITE_CONVERSIONS",  # hardcoded: all campaigns are OUTCOME_SALES
+            "optimization_goal": optimization_goal,
             "targeting": json.dumps(targeting),
         }
 
-        # Budget
         using_adset_budget = False
         if spec.daily_budget is not None:
             data["daily_budget"] = str(spec.daily_budget)
@@ -1617,43 +1640,36 @@ class MetaClient:
             data["lifetime_budget"] = str(spec.lifetime_budget)
             using_adset_budget = True
 
-        # Bid settings
         if spec.bid_amount is not None:
             data["bid_amount"] = str(spec.bid_amount)
 
-        # only send bid_strategy if it's non-empty
         if spec.bid_strategy:
             data["bid_strategy"] = str(spec.bid_strategy).strip()
 
-
-        # Schedule
         if spec.start_time is not None:
             data["start_time"] = spec.start_time
         if spec.end_time is not None:
             data["end_time"] = spec.end_time
 
-        # Promoted object - hardcoded for OUTCOME_SALES + OFFSITE_CONVERSIONS
-        data["promoted_object"] = json.dumps({
-            "pixel_id": "1069467584465713",
-            "custom_event_type": "PURCHASE"
-        })
+        if spec.promoted_object is not None:
+            data["promoted_object"] = json.dumps(spec.promoted_object)
+        elif optimization_goal in {"OFFSITE_CONVERSIONS", "CONVERSIONS"}:
+            data["promoted_object"] = json.dumps({
+                "pixel_id": "1069467584465713",
+                "custom_event_type": "PURCHASE"
+            })
 
-        # ✅ REQUIRED field for your account when using adset budgets
-        # Force send as "true"/"false" (string) for Graph form encoding.
         if using_adset_budget:
             enabled = bool(spec.is_adset_budget_sharing_enabled)
             data["is_adset_budget_sharing_enabled"] = "true" if enabled else "false"
 
-        # DSA transparency fields (EU accounts) - must be added before dry_run return
         if spec.dsa_beneficiary is not None:
             data["dsa_beneficiary"] = spec.dsa_beneficiary
         if spec.dsa_payor is not None:
             data["dsa_payor"] = spec.dsa_payor
 
-        # Always enable Website Events tracking (hardcoded)
         data["destination_type"] = "WEBSITE"
 
-        # Always exclude configured Custom Audiences (e.g. Purchasers 180D).
         if excluded_ids:
             data["excluded_custom_audiences"] = json.dumps(targeting.get("excluded_custom_audiences", []))
 
@@ -1662,7 +1678,17 @@ class MetaClient:
             return "DRY_RUN_ADSET_ID"
 
         logging.warning("[create_adset] payload: %s", json.dumps(data, indent=2))
-        payload = self._request("POST", f"/{acct}/adsets", data=data)
+        try:
+            payload = self._request("POST", f"/{acct}/adsets", data=data)
+        except MetaAPIError as e:
+            if e.http_status == 400 and str((e.error or {}).get("error_subcode") or "") == "1870227":
+                targeting_automation["advantage_audience"] = _get_advantage_audience_default()
+                targeting["targeting_automation"] = targeting_automation
+                data["targeting"] = json.dumps(targeting)
+                logging.warning("[create_adset] retrying with explicit targeting_automation.advantage_audience")
+                payload = self._request("POST", f"/{acct}/adsets", data=data, max_retries=0)
+            else:
+                raise
         return payload["id"]
 
 
@@ -2243,6 +2269,119 @@ def _normalize_drive_download_url(url: str) -> str:
     return url
 
 
+def _fetch_remote_video_bytes(url: str, *, timeout_s: int = 600) -> tuple[bytes, str]:
+    """Download video from URL, handling Google Drive virus scan warnings.
+    
+    Returns (video_bytes, filename).
+    """
+    url = _normalize_drive_download_url((url or "").strip())
+    if not url.lower().startswith(("http://", "https://")):
+        raise ValueError("video_url must start with http:// or https://")
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0 Safari/537.36"
+        ),
+        "Accept": "video/*,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    sess = requests.Session()
+    resp = sess.get(url, headers=headers, timeout=timeout_s, allow_redirects=True)
+    resp.raise_for_status()
+
+    ct = (resp.headers.get("Content-Type") or "").lower()
+    raw = resp.content or b""
+    head = raw[:2048].lstrip().lower()
+    is_html = ("text/html" in ct) or head.startswith(b"<!doctype html") or head.startswith(b"<html")
+
+    if is_html:
+        text = raw[:250_000].decode("utf-8", errors="ignore")
+        lower = text.lower()
+        if "virus scan warning" in lower and "google drive" in lower:
+            confirm = None
+            m = re.search(r'confirm=([^&\"\'\s]+)', text)
+            if m:
+                confirm = m.group(1)
+            if not confirm:
+                m = re.search(r'id=[\"\']uc-download-link[\"\'][^>]+href=[\"\']([^\"\']+)[\"\']', text, flags=re.I)
+                if m:
+                    href = m.group(1).replace('&amp;', '&')
+                    m2 = re.search(r'confirm=([^&\"\'\s]+)', href)
+                    if m2:
+                        confirm = m2.group(1)
+            if not confirm:
+                m = re.search(r'downloadUrl[\"\']\s*[:=]\s*[\"\']([^\"\']+)[\"\']', text, flags=re.I)
+                if m:
+                    dl = m.group(1)
+                    dl = dl.replace('\\u0026', '&').replace('\\u003d', '=').replace('&amp;', '&')
+                    try:
+                        dl = bytes(dl, 'utf-8').decode('unicode_escape')
+                    except Exception:
+                        pass
+                    m2 = re.search(r'confirm=([^&\"\'\s]+)', dl)
+                    if m2:
+                        confirm = m2.group(1)
+            if not confirm:
+                m = re.search(r'name=[\"\']confirm[\"\']\s+value=[\"\']([^\"\']+)[\"\']', text, flags=re.I)
+                if m:
+                    confirm = m.group(1)
+            if not confirm:
+                try:
+                    cookie_items = list(resp.cookies.items()) + [(getattr(c, 'name', None), getattr(c, 'value', None)) for c in getattr(sess, 'cookies', [])]
+                    for k, v in cookie_items:
+                        kk = (k or '').lower()
+                        if (('download_warning' in kk) or ('warning' in kk)) and v:
+                            confirm = v
+                            break
+                except Exception:
+                    pass
+            if not confirm:
+                confirm = 't'
+
+            qs = parse_qs(urlparse(resp.url).query)
+            file_id = (qs.get("id") or [None])[0]
+            if not file_id and "drive.google.com/file/d/" in url:
+                try:
+                    file_id = url.split("/file/d/")[1].split("/")[0]
+                except Exception:
+                    file_id = None
+            if not file_id:
+                raise ValueError(f"Google Drive video warning page returned without file id. final_url={resp.url}")
+
+            final_p = urlparse(resp.url)
+            retry_url = f"{final_p.scheme}://{final_p.netloc}{final_p.path}"
+            base_qs = parse_qs(final_p.query)
+            params = {k: (v[-1] if isinstance(v, list) and v else v) for k, v in base_qs.items()}
+            if not params.get("id") and file_id:
+                params["id"] = file_id
+            params.setdefault("export", "download")
+            params["confirm"] = confirm
+            resp = sess.get(retry_url, params=params, headers=headers, timeout=timeout_s, allow_redirects=True)
+            resp.raise_for_status()
+            ct = (resp.headers.get("Content-Type") or "").lower()
+            raw = resp.content or b""
+            head = raw[:2048].lstrip().lower()
+            is_html = ("text/html" in ct) or head.startswith(b"<!doctype html") or head.startswith(b"<html")
+
+        if is_html:
+            raise ValueError(
+                f"URL returned HTML, not a downloadable video. content-type={ct} final_url={resp.url} preview={raw[:200]!r}"
+            )
+
+    if len(raw) < 1024:
+        raise ValueError(
+            f"Downloaded content too small to be a video ({len(raw)} bytes). content-type={ct} final_url={resp.url}"
+        )
+
+    filename = _guess_filename_from_response(url, resp, default="video.mp4")
+    if "." not in filename:
+        filename = filename + ".mp4"
+    return raw, filename
+
+
 def _guess_media_type_from_url(url: str) -> Optional[str]:
     u = (url or "").lower()
     for ext in (".mp4", ".mov", ".m4v", ".webm"):
@@ -2443,8 +2582,178 @@ def inject_video_id(plan: 'LaunchPlan', video_id: str, *, thumbnail_url: Optiona
     )
 
 
+def _normalize_carousel_child_attachment(card: Any) -> Dict[str, Any]:
+    if not isinstance(card, dict):
+        return {}
+
+    out = dict(card)
+
+    def _take(*keys: str) -> Optional[str]:
+        for key in keys:
+            val = out.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+        return None
+
+    if not out.get("name"):
+        name = _take("headline", "title")
+        if name:
+            out["name"] = name
+
+    if not out.get("description"):
+        desc = _take("link_description", "card_description", "caption")
+        if desc:
+            out["description"] = desc
+
+    if not out.get("link"):
+        link = _take("url", "website_url", "href", "destination_url")
+        if link:
+            out["link"] = link
+
+    if not out.get("image_hash"):
+        image_hash = _take("hash")
+        if image_hash:
+            out["image_hash"] = image_hash
+
+    if not out.get("picture"):
+        picture = _take("image_url", "media_url")
+        if picture:
+            out["picture"] = picture
+
+    for key in (
+        "headline",
+        "title",
+        "link_description",
+        "card_description",
+        "caption",
+        "url",
+        "website_url",
+        "href",
+        "destination_url",
+        "hash",
+        "media_url",
+    ):
+        out.pop(key, None)
+
+    return out
+
+
+def _get_plan_carousel_cards(plan: 'LaunchPlan') -> List[Dict[str, Any]]:
+    cards: Any = None
+    if getattr(plan.creative, "carousel_cards", None):
+        cards = plan.creative.carousel_cards
+    else:
+        oss = plan.creative.object_story_spec or {}
+        ld = oss.get("link_data") if isinstance(oss, dict) else None
+        if isinstance(ld, dict):
+            cards = ld.get("child_attachments")
+
+    if not isinstance(cards, list):
+        return []
+
+    out: List[Dict[str, Any]] = []
+    for card in cards:
+        normalized = _normalize_carousel_child_attachment(card)
+        if normalized:
+            out.append(normalized)
+    return out
+
+
+def _ensure_carousel_card_media_for_plan(client: 'MetaClient', cfg: MetaConfig, plan: 'LaunchPlan', *, dry_run: bool, stable_for_queue: bool) -> 'LaunchPlan':
+    cards = _get_plan_carousel_cards(plan)
+    if not cards:
+        return plan
+
+    # Validate minimum carousel cards (Meta requires 2-10)
+    if len(cards) < 2:
+        logging.warning(f"Carousel requires at least 2 cards, got {len(cards)}. Skipping carousel.")
+        return plan
+    if len(cards) > 10:
+        logging.warning(f"Carousel has {len(cards)} cards, truncating to 10 (Meta limit).")
+        cards = cards[:10]
+
+    changed = False
+    resolved: List[Dict[str, Any]] = []
+    failed_cards: List[int] = []
+    
+    for idx, card in enumerate(cards, start=1):
+        c = dict(card)
+        image_hash = str(c.get("image_hash") or "").strip() or None
+        picture = str(c.get("picture") or c.get("image_url") or "").strip() or None
+        image_path = str(c.get("image_path") or "").strip() or None
+
+        if picture:
+            picture = _normalize_drive_download_url(picture)
+
+        if not image_hash and (image_path or picture):
+            if stable_for_queue and picture and not dry_run:
+                c["picture"] = picture
+            else:
+                if dry_run:
+                    image_hash = f"DRY_RUN_IMAGE_HASH_{idx}"
+                else:
+                    # Add error handling for image upload
+                    try:
+                        if image_path:
+                            image_hash = client.upload_image(image_path=image_path)
+                        else:
+                            img_bytes, fname = _fetch_and_normalize_image_bytes(picture, timeout_s=cfg.timeout_s)
+                            image_hash = client.upload_image(image_bytes=img_bytes, filename=fname)
+                    except Exception as e:
+                        logging.error(f"Failed to upload carousel card {idx} image: {e}")
+                        # Keep track of failed cards but continue processing others
+                        failed_cards.append(idx)
+                        # If we have picture URL, keep it as fallback for stable_for_queue
+                        if picture:
+                            c["picture"] = picture
+                        image_hash = None
+                
+                if image_hash:
+                    c["image_hash"] = image_hash
+                    c.pop("picture", None)
+                    c.pop("image_url", None)
+                    c.pop("image_path", None)
+                    changed = True
+
+        # Validate that card has either image_hash or picture
+        if not c.get("image_hash") and not c.get("picture"):
+            logging.warning(f"Carousel card {idx} has no image (hash or URL), skipping.")
+            failed_cards.append(idx)
+            continue
+
+        # Validate required fields
+        if not c.get("link") and not c.get("name"):
+            logging.warning(f"Carousel card {idx} missing both link and name, skipping.")
+            failed_cards.append(idx)
+            continue
+
+        resolved.append(_normalize_carousel_child_attachment(c))
+
+    # Final validation: ensure we still have at least 2 valid cards
+    if len(resolved) < 2:
+        logging.error(f"Carousel ended up with only {len(resolved)} valid cards after processing. Need at least 2. Failed cards: {failed_cards}")
+        raise ValueError(f"Carousel requires at least 2 valid cards, got {len(resolved)}. Failed to upload cards: {failed_cards}")
+
+    if failed_cards:
+        logging.warning(f"Carousel created with {len(resolved)} cards. Failed to process cards at positions: {failed_cards}")
+
+    oss = plan.creative.object_story_spec or {}
+    if not isinstance(oss, dict):
+        return plan
+    ld = oss.get("link_data")
+    if not isinstance(ld, dict):
+        ld = {}
+    ld["child_attachments"] = resolved
+    oss["link_data"] = ld
+    plan.creative.object_story_spec = oss
+    plan.creative.carousel_cards = resolved
+    return plan
+
+
 def ensure_media_for_plan(client: 'MetaClient', cfg: MetaConfig, plan: 'LaunchPlan', *, dry_run: bool, stable_for_queue: bool) -> 'LaunchPlan':
     """Ensure the plan has an uploaded asset reference (image_hash or video_id) and inject it into the creative."""
+    plan = _ensure_carousel_card_media_for_plan(client, cfg, plan, dry_run=dry_run, stable_for_queue=stable_for_queue)
+
     if not getattr(plan, "assets", None):
         return plan
 
@@ -2632,8 +2941,11 @@ def apply_flexible_text_variants(plan: 'LaunchPlan') -> 'LaunchPlan':
     thumb_hash: Optional[str] = None
     thumb_url: Optional[str] = None
 
-    # --- link_data (image/link creatives) ---
+    # --- link_data (image/link creatives, incl. carousel) ---
     ld = oss.get("link_data")
+    if getattr(plan.creative, "carousel_cards", None) and not isinstance(ld, dict):
+        ld = {}
+        oss["link_data"] = ld
     if isinstance(ld, dict):
         # URL: accept string or [string]
         link_vals = _coerce_str_list(ld.get("link"))
@@ -2642,6 +2954,60 @@ def apply_flexible_text_variants(plan: 'LaunchPlan') -> 'LaunchPlan':
             ld["link"] = link_url
         elif isinstance(ld.get("link"), str):
             link_url = (ld.get("link") or "").strip() or None
+
+        raw_cards: List[Dict[str, Any]] = []
+        if getattr(plan.creative, "carousel_cards", None):
+            raw_cards = _get_plan_carousel_cards(plan)
+        elif isinstance(ld.get("child_attachments"), list):
+            raw_cards = _get_plan_carousel_cards(plan)
+
+        if raw_cards:
+            msg0 = _first_str(ld.get("message")) or (opts.primary_texts[0] if opts.primary_texts else None)
+            desc0 = _first_str(ld.get("description")) or (opts.descriptions[0] if opts.descriptions else None)
+            if msg0:
+                ld["message"] = msg0
+            if desc0:
+                ld["description"] = desc0
+
+            normalized_cards: List[Dict[str, Any]] = []
+            for idx, card in enumerate(raw_cards):
+                c = _normalize_carousel_child_attachment(card)
+                if not c.get("link") and link_url:
+                    c["link"] = link_url
+                if not c.get("name") and idx < len(opts.headlines):
+                    c["name"] = opts.headlines[idx]
+                if not c.get("description") and idx < len(opts.descriptions):
+                    c["description"] = opts.descriptions[idx]
+                normalized_cards.append(c)
+
+            if not link_url:
+                for card in normalized_cards:
+                    card_link = card.get("link")
+                    if isinstance(card_link, str) and card_link.strip():
+                        link_url = card_link.strip()
+                        ld["link"] = link_url
+                        break
+
+            cta = ld.get("call_to_action")
+            if isinstance(cta, dict):
+                cta_type = (cta.get("type") or "").strip() or None
+                if link_url:
+                    val = cta.get("value")
+                    if not isinstance(val, dict):
+                        val = {}
+                    val.setdefault("link", link_url)
+                    cta["value"] = val
+                ld["call_to_action"] = cta
+            elif link_url:
+                ld["call_to_action"] = {"type": "LEARN_MORE", "value": {"link": link_url}}
+                cta_type = "LEARN_MORE"
+
+            ld["child_attachments"] = normalized_cards
+            plan.creative.carousel_cards = normalized_cards
+            plan.creative.asset_feed_spec = None
+            oss["link_data"] = ld
+            plan.creative.object_story_spec = oss
+            return plan
 
         # Text variants: accept string or list
         opts.primary_texts.extend([t for t in _coerce_str_list(ld.get("message")) if t])
