@@ -47,6 +47,78 @@ GROUP_SCAN_LIMIT = _get_int_env("WORKER_GROUP_SCAN_LIMIT", default=50)
 GROUP_DELAY_S = _get_int_env("WORKER_GROUP_DELAY_SECONDS", default=15)  # pause between groups
 
 
+def deduplicate_queue_v2() -> int:
+    """Remove duplicate entries from queue_v2 table.
+    
+    Keeps the oldest entry (lowest id) for each unique combination of:
+    (product, category, signature, video_id)
+    
+    Returns:
+        Number of duplicate entries deleted.
+    """
+    database_url = os.getenv("DATABASE_URL", "").strip()
+    if not database_url:
+        logging.warning("⚠️ DATABASE_URL not set, skipping deduplication")
+        return 0
+    
+    try:
+        import psycopg2
+        
+        conn = psycopg2.connect(database_url)
+        cur = conn.cursor()
+        
+        # SQL to delete duplicates, keeping the oldest (first) entry
+        dedupe_sql = """
+        WITH ranked_entries AS (
+            SELECT 
+                id,
+                product,
+                category,
+                video_id,
+                ROW_NUMBER() OVER (
+                    PARTITION BY product, category, signature, video_id 
+                    ORDER BY id ASC
+                ) as row_num
+            FROM queue_v2
+        )
+        DELETE FROM queue_v2
+        WHERE id IN (
+            SELECT id 
+            FROM ranked_entries 
+            WHERE row_num > 1
+        )
+        RETURNING id, video_id
+        """
+        
+        cur.execute(dedupe_sql)
+        deleted_rows = cur.fetchall()
+        deleted_count = len(deleted_rows)
+        
+        conn.commit()
+        cur.close()
+        conn.close()
+        
+        if deleted_count > 0:
+            deleted_ids = [str(row[0]) for row in deleted_rows[:10]]
+            deleted_videos = list(set(str(row[1]) for row in deleted_rows))
+            logging.warning(
+                f"🧹 Auto-cleanup: Removed {deleted_count} duplicate queue entries. "
+                f"Sample IDs: {', '.join(deleted_ids)}{'...' if len(deleted_rows) > 10 else ''}. "
+                f"Affected video_ids: {', '.join(deleted_videos)}"
+            )
+        else:
+            logging.debug("✅ No duplicates found in queue_v2")
+        
+        return deleted_count
+        
+    except ImportError:
+        logging.error("❌ psycopg2 not installed. Run: pip install psycopg2-binary")
+        return 0
+    except Exception as e:
+        logging.error(f"❌ Deduplication error: {e}", exc_info=True)
+        return 0
+
+
 def main() -> None:
     # ── Logging setup ──────────────────────────────────────────────────────────
     # Force logs to stdout so Railway captures them in the service log panel.
@@ -72,6 +144,11 @@ def main() -> None:
 
     while True:
         try:
+            # ✅ NEW: Deduplicate queue before processing
+            # This removes any duplicate entries that may have been created by
+            # multiple Notion rows with the same creative name
+            deduplicate_queue_v2()
+            
             groups = qstore.list_groups(limit=GROUP_SCAN_LIMIT)
             logging.info("Poll cycle: found %d group(s) in queue.", len(groups))
             for i, g in enumerate(groups):
