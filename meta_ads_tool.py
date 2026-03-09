@@ -95,9 +95,16 @@ def _extract_destination_url(object_story_spec: Any) -> str:
     return ""
 
 def derive_lp_marker(offer_page: str, url: str) -> str:
-    """Return 'LP###' derived from URL (preferred) or offer_page (fallback)."""
+    """Return 'LP###' derived from URL (preferred) or offer_page (fallback).
+    
+    Special case: URLs ending with '/gh-offer/' or '/gh-offer' return 'Offer page'.
+    """
     offer_page = (offer_page or "").strip()
     url = (url or "").strip()
+
+    # Special case: gh-offer URLs should use "Offer page" instead of LP###
+    if url and ("/gh-offer/" in url or url.endswith("/gh-offer")):
+        return "Offer page"
 
     # Prefer URL parsing: check common patterns in path/query.
     candidates: list[str] = []
