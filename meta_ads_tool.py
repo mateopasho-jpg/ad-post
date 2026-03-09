@@ -1366,17 +1366,22 @@ class MetaClient:
             end_offset = min(start_offset + chunk_size, file_size)
             chunk = video_bytes[start_offset:end_offset]
             
+            # Chunks must be sent as multipart form data
             chunk_data = {
                 "upload_phase": "transfer",
                 "upload_session_id": upload_session_id,
                 "start_offset": start_offset,
-                "video_file_chunk": chunk,
+            }
+            
+            chunk_files = {
+                "video_file_chunk": (f"chunk_{start_offset}", chunk, "application/octet-stream")
             }
             
             self._request(
                 "POST",
                 f"/{acct}/advideos",
                 data=chunk_data,
+                files=chunk_files,
                 use_video=True,
             )
             
@@ -1427,10 +1432,50 @@ class MetaClient:
           - Uses graph-video domain for upload.
           - Optionally waits until encoding is ready.
           - Automatically uses resumable upload for files > 100MB.
+          - For Google Drive URLs >100MB, downloads first then uses chunked upload.
         """
         acct = normalize_ad_account_id(ad_account_id or self.cfg.ad_account_id)
 
         if file_url:
+            # Check if this is a Google Drive URL - we may need to download it for chunked upload
+            is_drive_url = "drive.google.com" in file_url or "drive.usercontent.google.com" in file_url
+            
+            if is_drive_url:
+                # HEAD request to check file size before deciding upload method
+                try:
+                    normalized_url = _normalize_drive_download_url(file_url)
+                    
+                    import requests
+                    head_resp = requests.head(normalized_url, allow_redirects=True, timeout=30)
+                    content_length = head_resp.headers.get('Content-Length')
+                    
+                    if content_length:
+                        file_size = int(content_length)
+                        SIZE_THRESHOLD = 100 * 1024 * 1024  # 100MB
+                        
+                        if file_size > SIZE_THRESHOLD:
+                            # Download the video and use chunked upload
+                            logging.info(f"Large Google Drive video detected ({file_size} bytes), downloading for chunked upload")
+                            get_resp = requests.get(normalized_url, timeout=600)  # 10 min timeout for large files
+                            get_resp.raise_for_status()
+                            video_bytes = get_resp.content
+                            
+                            video_id = self.upload_video_resumable(
+                                video_bytes=video_bytes,
+                                filename=filename,
+                                name=name,
+                                ad_account_id=acct,
+                            )
+                            
+                            if wait_for_ready:
+                                self.wait_for_video_ready(video_id, timeout_s=wait_timeout_s, poll_s=wait_poll_s)
+                            
+                            return video_id
+                except Exception as e:
+                    # If size check fails, fall back to simple URL upload
+                    logging.warning(f"Could not check Google Drive file size, falling back to simple upload: {e}")
+            
+            # Simple URL upload for non-Drive URLs or small files
             data: Dict[str, Any] = {"file_url": file_url}
             if name:
                 data["name"] = name
