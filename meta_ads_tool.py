@@ -3403,8 +3403,9 @@ def auto_fix_optimization_goal(client, campaign_id: str, adset_spec) -> None:
     }
     
     try:
-        # Fetch campaign objective from Meta
-        campaign_data = client.get(
+        # Fetch campaign objective from Meta using _request
+        campaign_data = client._request(
+            "GET",
             f"/{campaign_id}",
             params={"fields": "id,name,objective"}
         )
