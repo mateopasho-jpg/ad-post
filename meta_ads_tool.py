@@ -2376,6 +2376,29 @@ def _fetch_remote_video_bytes(url: str, *, timeout_s: int = 600) -> tuple[bytes,
             f"Downloaded content too small to be a video ({len(raw)} bytes). content-type={ct} final_url={resp.url}"
         )
 
+    # Extract filename from response headers or URL
+    def _guess_filename_from_response(url: str, resp, default: str = "video.mp4") -> str:
+        """Try to extract filename from Content-Disposition header or URL."""
+        # Try Content-Disposition header first
+        cd = resp.headers.get("Content-Disposition", "")
+        if cd and "filename=" in cd:
+            parts = cd.split("filename=")
+            if len(parts) > 1:
+                fname = parts[1].strip().strip('"').strip("'")
+                if fname and "." in fname:
+                    return fname
+        
+        # Fall back to URL path
+        from urllib.parse import urlparse, unquote
+        parsed = urlparse(url)
+        path = unquote(parsed.path)
+        if path and "/" in path:
+            fname = path.split("/")[-1]
+            if fname and "." in fname:
+                return fname
+        
+        return default
+    
     filename = _guess_filename_from_response(url, resp, default="video.mp4")
     if "." not in filename:
         filename = filename + ".mp4"
