@@ -1726,12 +1726,47 @@ class MetaClient:
         return self._request("DELETE", f"/{object_id}", data={})
 
     def create_ad(self, spec: AdSpec, adset_id: str, creative_id: str, *, dry_run: bool = False) -> str:
+        """Create an ad. Automatically detects and enables dynamic creative if needed.
+        
+        Args:
+            spec: Ad specification
+            adset_id: AdSet ID to create the ad in
+            creative_id: Creative ID to use
+            dry_run: If True, don't actually create the ad
+            
+        Returns:
+            Ad ID
+        """
         acct = normalize_ad_account_id(self.cfg.ad_account_id)
+        
+        # Build creative object - always start with just the ID
+        creative_obj = {"creative_id": creative_id}
+        
+        # Auto-detect: Check if this creative uses asset_feed_spec (dynamic creative)
+        # by fetching the creative and checking for asset_feed_spec field
+        try:
+            creative_data = self._request("GET", f"/{creative_id}", params={"fields": "asset_feed_spec"})
+            has_asset_feed_spec = bool(creative_data.get("asset_feed_spec"))
+            
+            if has_asset_feed_spec:
+                # Add degrees_of_freedom_spec for dynamic creative support
+                creative_obj["degrees_of_freedom_spec"] = {
+                    "creative_features_spec": {
+                        "standard_enhancements": {
+                            "enroll_status": "OPT_IN"
+                        }
+                    }
+                }
+                logging.info(f"✅ Auto-detected asset_feed_spec for creative {creative_id}, enabling dynamic creative")
+        except Exception as e:
+            # If we can't fetch creative details, proceed without degrees_of_freedom_spec
+            logging.debug(f"Could not auto-detect asset_feed_spec for creative {creative_id}: {e}")
+        
         data = {
             "name": spec.name,
             "adset_id": adset_id,
-            # creative must be a JSON object containing creative_id
-            "creative": json.dumps({"creative_id": creative_id}),
+            # creative must be a JSON object containing creative_id (and optionally degrees_of_freedom_spec)
+            "creative": json.dumps(creative_obj),
             "status": spec.status,
         }
 
@@ -3882,6 +3917,7 @@ def _drain_queue_group_v2(
                 if dry_run:
                     ad_id = "DRY_RUN_AD_ID"
                 else:
+                    # create_ad will auto-detect if creative uses asset_feed_spec
                     ad_id = client.create_ad(p.ad, adset_id=adset_id, creative_id=cid, dry_run=False)
                 created_ads.append(ad_id)
                 processed_ids.append(int(item["queue_id"]))
