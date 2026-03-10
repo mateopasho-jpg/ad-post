@@ -146,7 +146,7 @@ def main() -> None:
         try:
             # ✅ NEW: Deduplicate queue before processing
             # This removes any duplicate entries that may have been created by
-            # multiple Notion rows with the same creative name
+            # multiple Notion rows with the same creative name..
             deduplicate_queue_v2()
             
             groups = qstore.list_groups(limit=GROUP_SCAN_LIMIT)
