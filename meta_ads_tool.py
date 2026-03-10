@@ -1603,7 +1603,7 @@ class MetaClient:
         return payload["id"]
 
 
-    def create_adset(self, spec: AdSetSpec, campaign_id: str, *, dry_run: bool = False) -> str:
+    def create_adset(self, spec: AdSetSpec, campaign_id: str, *, dry_run: bool = False, use_dynamic_creative: bool = False) -> str:
         acct = normalize_ad_account_id(self.cfg.ad_account_id)
 
         targeting = dict(spec.targeting or {})
@@ -1667,6 +1667,19 @@ class MetaClient:
             data["dsa_beneficiary"] = spec.dsa_beneficiary
         if spec.dsa_payor is not None:
             data["dsa_payor"] = spec.dsa_payor
+
+        # NEW: Add creative_spec for dynamic creative AdSets (required for asset_feed_spec)
+        if use_dynamic_creative:
+            data["creative_spec"] = json.dumps({
+                "degrees_of_freedom_spec": {
+                    "creative_features_spec": {
+                        "standard_enhancements": {
+                            "enroll_status": "OPT_IN"
+                        }
+                    }
+                }
+            })
+            logging.info("✅ Enabling dynamic creative for AdSet (required for asset_feed_spec ads)")
 
         data["destination_type"] = "WEBSITE"
 
@@ -3899,12 +3912,23 @@ def _drain_queue_group_v2(
                 created_creatives.append(cid)
 
             # 2) Create the adset
+            # Auto-detect if ANY creative in this batch uses asset_feed_spec
+            batch_uses_asset_feed_spec = any(
+                bool(item["plan"].creative.asset_feed_spec) for item in prepared
+            )
+            
             if dry_run:
                 adset_id = "DRY_RUN_ADSET_ID"
             else:
                 # Auto-fix optimization_goal to match campaign objective
                 auto_fix_optimization_goal(client, chosen_campaign_id, adset_spec)
-                adset_id = client.create_adset(adset_spec, campaign_id=chosen_campaign_id, dry_run=False)
+                # Enable dynamic creative if batch uses asset_feed_spec
+                adset_id = client.create_adset(
+                    adset_spec, 
+                    campaign_id=chosen_campaign_id, 
+                    dry_run=False,
+                    use_dynamic_creative=batch_uses_asset_feed_spec
+                )
 
             # 3) Create all ads referencing the creatives
             created_ads: List[str] = []
