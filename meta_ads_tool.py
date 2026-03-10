@@ -3382,6 +3382,64 @@ def _run_launch_plan_v1(
 
 
 
+def auto_fix_optimization_goal(client, campaign_id: str, adset_spec) -> None:
+    """Auto-detect campaign objective and set compatible optimization_goal.
+    
+    Modifies adset_spec.optimization_goal in-place to match the campaign's objective.
+    
+    Args:
+        client: MetaClient instance
+        campaign_id: The campaign ID to check
+        adset_spec: The AdSet spec to modify
+    """
+    # Mapping of campaign objectives to valid optimization goals
+    OBJECTIVE_TO_OPTIMIZATION = {
+        "OUTCOME_SALES": "OFFSITE_CONVERSIONS",
+        "OUTCOME_TRAFFIC": "LINK_CLICKS",
+        "OUTCOME_ENGAGEMENT": "POST_ENGAGEMENT",
+        "OUTCOME_LEADS": "LEAD_GENERATION",
+        "OUTCOME_APP_PROMOTION": "APP_INSTALLS",
+        "OUTCOME_AWARENESS": "REACH",
+    }
+    
+    try:
+        # Fetch campaign objective from Meta
+        campaign_data = client.get(
+            f"/{campaign_id}",
+            params={"fields": "id,name,objective"}
+        )
+        
+        objective = campaign_data.get("objective")
+        if not objective:
+            logging.warning(f"Could not determine objective for campaign {campaign_id}, keeping optimization_goal as-is")
+            return
+        
+        # Get the correct optimization_goal for this objective
+        correct_optimization_goal = OBJECTIVE_TO_OPTIMIZATION.get(objective)
+        
+        if not correct_optimization_goal:
+            logging.warning(f"Unknown campaign objective '{objective}' for campaign {campaign_id}, keeping optimization_goal as-is")
+            return
+        
+        # Check if current optimization_goal is different
+        current_optimization_goal = adset_spec.optimization_goal
+        
+        if current_optimization_goal != correct_optimization_goal:
+            logging.warning(
+                f"🔧 Auto-fix: Campaign {campaign_id} has objective='{objective}'. "
+                f"Changing optimization_goal from '{current_optimization_goal}' to '{correct_optimization_goal}'"
+            )
+            adset_spec.optimization_goal = correct_optimization_goal
+        else:
+            logging.debug(
+                f"✅ Optimization goal '{current_optimization_goal}' already matches campaign objective '{objective}'"
+            )
+            
+    except Exception as e:
+        logging.error(f"Failed to auto-fix optimization_goal for campaign {campaign_id}: {e}")
+        # Don't crash - just keep the original optimization_goal
+
+
 def _drain_queue_group_v2(
     cfg: MetaConfig,
     *,
@@ -3808,6 +3866,8 @@ def _drain_queue_group_v2(
             if dry_run:
                 adset_id = "DRY_RUN_ADSET_ID"
             else:
+                # Auto-fix optimization_goal to match campaign objective
+                auto_fix_optimization_goal(client, chosen_campaign_id, adset_spec)
                 adset_id = client.create_adset(adset_spec, campaign_id=chosen_campaign_id, dry_run=False)
 
             # 3) Create all ads referencing the creatives
